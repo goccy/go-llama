@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify llama.go attestation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # make verify fetches the upstream llama-wasm release attestation
+      # (anonymously; no token) and confirms the committed bridge
+      # internal/llama.go is a signed subject of it — the bridge is a
+      # generated release artifact, not hand-written code.
+      - name: Verify bridge file (release attestation)
+        run: make verify
+
+  test-amd64:
+    name: Go test (amd64 GOAMD64 ${{ matrix.goamd64 }})
+    runs-on: ubuntu-latest
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        # v1 exercises the scalar-fallback path; v2 the SSE4.1 SIMD
+        # splices. Both must pass — the memory64 bundle is amd64-correct
+        # only across both.
+        goamd64: [v1, v2]
+    env:
+      GOAMD64: ${{ matrix.goamd64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # make test fetches the tiny stories260K model, then `go test ./...`.
+      # The native-reference and benchmark tests skip without a native
+      # llama.cpp build / the larger models.
+      - run: make test
+
+  test-arm64:
+    name: Go test (arm64)
+    # Native arm64 runner: this is the flagship target, where wasm2go
+    # splices the SDOT/SMMLA superinstructions. A cross GOARCH=arm64 build
+    # on an x86 host would not exercise that native assembly, so run it on
+    # real hardware.
+    runs-on: ubuntu-24.04-arm
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make test

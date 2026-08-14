@@ -1,0 +1,39 @@
+{
+ "comment": "teacher-forced NLL at the pinned llama.cpp commit (same definition as llama_ctx_score); see verify_compat_test.go",
+ "nll": {
+  "stories260K.gguf": {
+   "The quick brown fox jumps over the lazy dog.": {
+    "n_tokens": 30,
+    "n_scored": 29,
+    "nll": 70.444951
+   },
+   "Once upon a time there was a little girl who loved to play outside. She ran through the meadow and laughed at the clouds.": {
+    "n_tokens": 54,
+    "n_scored": 53,
+    "nll": 48.669271
+   },
+   "日本の首都は東京です。東京は世界最大の都市圏を形成しています。": {
+    "n_tokens": 95,
+    "n_scored": 94,
+    "nll": 2432.876617
+   }
+  },
+  "qwen2.5-0.5b-instruct-q8_0.gguf": {
+   "The quick brown fox jumps over the lazy dog.": {
+    "n_tokens": 10,
+    "n_scored": 9,
+    "nll": 9.732982
+   },
+   "Once upon a time there was a little girl who loved to play outside. She ran through the meadow and laughed at the clouds.": {
+    "n_tokens": 27,
+    "n_scored": 26,
+    "nll": 57.501683
+   },
+   "日本の首都は東京です。東京は世界最大の都市圏を形成しています。": {
+    "n_tokens": 20,
+    "n_scored": 19,
+    "nll": 43.19526
+   }
+  }
+ }
+}
