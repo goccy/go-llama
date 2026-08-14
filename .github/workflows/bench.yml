@@ -94,6 +94,19 @@ jobs:
           go test -run=NONE -bench='BenchmarkPromptEval$' \
             -benchtime=${{ inputs.prompt_reps || '6' }}x -count=3 -timeout=30m . | tee pp.txt
 
+      - name: CPU profile (decode)
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          go test -run=NONE -bench='BenchmarkDecode$' \
+            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=1 -timeout=30m \
+            -cpuprofile=cpu.prof .
+          echo "### top-30 flat ###"
+          go tool pprof -top -nodecount=30 go-llama.test cpu.prof
+          echo "### top-15 cumulative ###"
+          go tool pprof -top -cum -nodecount=15 go-llama.test cpu.prof
+
       - name: Summary
         if: always()
         run: |
