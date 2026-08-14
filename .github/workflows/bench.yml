@@ -1,0 +1,105 @@
+name: Bench
+
+# On-demand throughput benchmark used to drive the amd64 SIMD work: it reports
+# token-generation (tg) and prompt-processing (pp) tok/s for a Q8_0 model on a
+# real amd64 runner and on a native arm64 runner, so the two can be compared,
+# and prints each runner's CPU SIMD capabilities. Trigger with:
+#   gh workflow run bench.yml -f llamawasm2go_ref=<branch-or-version>
+# It also runs automatically on every push to a perf/** branch, benchmarking
+# whatever llamawasm2go the branch's go.mod pins — that is the amd64 dev loop.
+on:
+  push:
+    branches: ["perf/**"]
+  workflow_dispatch:
+    inputs:
+      llamawasm2go_ref:
+        description: "llamawasm2go module version or branch to benchmark (blank = go.mod pin)"
+        required: false
+        default: ""
+      decode_tokens:
+        description: "tokens to decode for the tg benchmark"
+        required: false
+        default: "48"
+      prompt_reps:
+        description: "iterations for the pp benchmark"
+        required: false
+        default: "6"
+
+permissions:
+  contents: read
+
+env:
+  # The Q8_0 model whose vec_dot kernel the SIMD work targets. Small enough to
+  # fetch per run, quantized so it exercises the integer dot path.
+  MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+  MODEL_PATH: testdata/qwen2.5-0.5b-instruct-q8_0.gguf
+
+jobs:
+  bench:
+    name: Bench (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64 GOAMD64=v2 (SSE4.1)
+            runner: ubuntu-latest
+            goamd64: v2
+          - name: arm64 (native)
+            runner: ubuntu-24.04-arm
+            goamd64: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: CPU capabilities
+        run: |
+          echo "=== uname ==="; uname -m
+          echo "=== lscpu ==="; lscpu || true
+          echo "=== SIMD flags ==="
+          if [ "$(uname -m)" = "x86_64" ]; then
+            grep -om1 -E 'flags.*' /proc/cpuinfo | tr ' ' '\n' \
+              | grep -E '^(sse4_2|avx|avx2|avx512f|avx512bw|avx512vl|avx512vnni|avx_vnni|amx_int8)$' | sort -u \
+              | sed 's/^/  have: /' || true
+          else
+            grep -om1 -E 'Features.*' /proc/cpuinfo | tr ' ' '\n' \
+              | grep -E '^(asimd|asimddp|i8mm|sve|sve2|bf16)$' | sort -u \
+              | sed 's/^/  have: /' || true
+          fi
+
+      - name: Point at a llamawasm2go ref
+        if: ${{ inputs.llamawasm2go_ref != '' }}
+        run: |
+          go get github.com/goccy/llamawasm2go@${{ inputs.llamawasm2go_ref }}
+          go mod tidy
+          echo "llamawasm2go now:"; go list -m github.com/goccy/llamawasm2go
+
+      - name: Fetch Q8_0 model
+        run: |
+          mkdir -p testdata
+          curl -fSL --proto '=https' --tlsv1.2 -o "$MODEL_PATH" "$MODEL_URL"
+          ls -la "$MODEL_PATH"
+
+      - name: Benchmark
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          echo "### tg (token generation) ###"
+          go test -run=NONE -bench='BenchmarkDecode$' \
+            -benchtime=${{ inputs.decode_tokens }}x -count=3 -timeout=30m . | tee tg.txt
+          echo "### pp (prompt processing) ###"
+          go test -run=NONE -bench='BenchmarkPromptEval$' \
+            -benchtime=${{ inputs.prompt_reps }}x -count=3 -timeout=30m . | tee pp.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.name }}";
+            echo '```';
+            grep -hE 'tok/s|prompt_tok/s' tg.txt pp.txt 2>/dev/null || echo "(no results)";
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
