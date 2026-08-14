@@ -89,10 +89,10 @@ jobs:
         run: |
           echo "### tg (token generation) ###"
           go test -run=NONE -bench='BenchmarkDecode$' \
-            -benchtime=${{ inputs.decode_tokens }}x -count=3 -timeout=30m . | tee tg.txt
+            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=3 -timeout=30m . | tee tg.txt
           echo "### pp (prompt processing) ###"
           go test -run=NONE -bench='BenchmarkPromptEval$' \
-            -benchtime=${{ inputs.prompt_reps }}x -count=3 -timeout=30m . | tee pp.txt
+            -benchtime=${{ inputs.prompt_reps || '6' }}x -count=3 -timeout=30m . | tee pp.txt
 
       - name: Summary
         if: always()
