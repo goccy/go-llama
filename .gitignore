@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Test models: `make testdata` downloads them; they are not source.
+testdata/*.gguf
