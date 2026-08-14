@@ -1,5 +1,8 @@
 # go-llama
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/goccy/go-llama.svg)](https://pkg.go.dev/github.com/goccy/go-llama)
+[![CI](https://github.com/goccy/go-llama/actions/workflows/ci.yml/badge.svg)](https://github.com/goccy/go-llama/actions/workflows/ci.yml)
+
 **llama.cpp in pure Go — run GGUF models anywhere Go runs. No cgo, no shared
 library, one static binary.**
 
@@ -19,7 +22,13 @@ import (
 )
 
 func main() {
-	model, err := llama.LoadModel("model.gguf")
+	inst, err := llama.New()
+	if err != nil {
+		panic(err)
+	}
+	defer inst.Close()
+
+	model, err := inst.LoadModel("model.gguf")
 	if err != nil {
 		panic(err)
 	}
@@ -46,68 +55,98 @@ func main() {
 ## Features
 
 - **Pure Go**: works anywhere Go compiles; `CGO_ENABLED=0` friendly.
+- **Independent instances**: `llama.New` builds an engine with its own linear
+  memory; create several and run them concurrently and in isolation.
 - **One model, many contexts**: contexts share the weights and keep their own
-  KV cache, which is how to serve independent conversations from one model.
+  KV cache, which is how to serve independent conversations from one model. One
+  instance can also hold several models — what speculative decoding needs.
 - **Sampling**: temperature, top-k, top-p, min-p, typical-p, repetition /
   presence / frequency penalties, seeds, and GBNF grammars.
 - **Streaming**: `Context.Stream` calls you back with each piece of text as it
   is decoded.
 - **Interruptible**: `Context.Interrupt` stops a running generation from
   another goroutine.
-- **Chat templates** and **embeddings**.
-- **Configurable sandbox**: `Init` can scope the guest to one directory, hand
-  it an in-memory filesystem, cap its memory, and capture its stdio.
+- **Speculative decoding**, **LoRA adapters**, **chat templates**,
+  **embeddings**, **scoring**, and **state save / load**.
+- **Configurable sandbox**: options on `New` scope the guest to one directory,
+  hand it an in-memory filesystem, cap its memory, and capture its stdio.
 
 ```go
-llama.Init(llama.Config{
-	PreopenDir:     "/srv/models", // the only directory the guest can see
-	MaxMemoryBytes: 6 << 30,       // fail inside the guest, not in the host
-})
+inst, err := llama.New(
+	llama.WithPreopenDir("/srv/models"), // the only directory the guest can see
+	llama.WithMaxMemory(6<<30),          // fail inside the guest, not in the host
+)
 ```
+
+## Instances, models and contexts
+
+`llama.New` returns a `*Llama` — one engine instance, with its own linear
+memory and C heap. It is fully independent of any other instance, so several
+can run concurrently on separate goroutines.
+
+Within an instance you load one or more models with `LoadModel`; each model
+spawns contexts with `NewContext` that share its weights and keep their own KV
+cache. Because a whole instance carries the engine's memory, the common shape
+is one instance with as many models and contexts as you need — reach for a
+second instance when you want hard isolation between them.
+
+```go
+inst, _ := llama.New()
+defer inst.Close()
+
+target, _ := inst.LoadModel("qwen2.5-3b.gguf")
+draft, _ := inst.LoadModel("qwen2.5-0.5b.gguf") // same instance: speculative decoding
+```
+
+Close contexts, then models, then the instance — using any handle after its
+owner is closed is a use-after-free in the engine, and closed handles are
+refused.
 
 ## Streaming and interruption
 
-Both work while a generation is running, and neither calls into the engine to
-do it — they exchange a word and a ring buffer with the guest through linear
-memory. That is not an optimisation: the engine is a single translated module
-with one C stack, so the goroutine running `Generate` is the only one that can
-be inside it.
+The engine is a single translated module with one C stack, so the goroutine
+running `Generate` is the only one that can be inside it. Streaming and
+interruption reach a running generation from opposite directions around that
+constraint:
 
 ```go
 res, err := ctx.Stream("Once upon a time", llama.Params{NPredict: 512},
 	func(piece string) { fmt.Print(piece) })
 ```
 
-`Stream` returns the same complete `Result` as `Generate`. If the callback
-cannot keep up, the engine drops pieces and `Stream` returns
-`ErrStreamOverrun` alongside the (still complete) result.
+`Stream` calls `onPiece` once per decoded token, on the generating goroutine
+itself — so there is no concurrency and nothing to drop, but the callback must
+be short and must not call back into the engine. It returns the same complete
+`Result` as `Generate` (the pieces concatenate to `Result.Text`; a `Params.Stop`
+string is delivered as decoded and only then trimmed, so the stream can run a
+few characters past the returned text). A nil `onPiece` makes `Stream` exactly
+`Generate`.
 
-## One engine per process
-
-The engine has one linear memory and one C heap, so there is one of it per
-process. Several models can be loaded at once and each gets its own contexts —
-that is llama.cpp's own model. `Init` configures the engine and takes effect
-once; `LoadModel` starts it with the defaults if `Init` has not run.
+`Interrupt` goes the other way: it writes one aligned word straight into linear
+memory (never calling into the engine), which the generation loop reads once per
+token. It is safe to call from any goroutine while a generation runs; `Generate`
+then returns what it has with `Reason == StopInterrupted`.
 
 ## Memory
 
 wasm32 caps linear memory at 4 GiB, and the model weights plus every context's
 KV cache live inside it. Target quantized models comfortably under that —
 roughly 3B parameters at Q4 — and size `ContextParams.NCtx` accordingly.
-`Config.MaxMemoryBytes` caps growth so an oversized model fails in the guest
-instead of growing the host process, and `Config.MemoryReserveBytes` reserves
-up front so a large load does not repeatedly grow and copy.
+`WithMaxMemory` caps growth so an oversized model fails in the guest instead of
+growing the host process, and `WithMemoryReserve` reserves up front so a large
+load does not repeatedly grow and copy.
 
 ## Performance
 
 The generated Go is compiled by the Go compiler, and on amd64/arm64 most of it
 ships as assembly derived from that compilation. The SIMD kernels ggml relies
 on are native NEON on arm64 and SSE on amd64 (the latter under `GOAMD64=v2` or
-higher — set it, or the vector helpers fall back to scalar Go).
+higher — set it, or the vector helpers fall back to scalar Go). arm64 is the
+flagship target, where the dot-product kernels lower to SDOT/SMMLA.
 
 ## Supply-chain verification
 
-`internal/bridge/llama.go` in this repository is a release artifact of
+`internal/llama.go` in this repository is a release artifact of
 [llama-wasm](https://github.com/goccy/llama-wasm), not hand-written code. It is
 refreshed with:
 
@@ -116,7 +155,8 @@ make llama LLAMA_WASM_VERSION=v0.1.0
 ```
 
 which downloads it and verifies its build-provenance attestation against
-llama-wasm's release workflow.
+llama-wasm's release workflow. CI re-runs that verification (`make verify`) on
+every push.
 
 ## Testing
 
