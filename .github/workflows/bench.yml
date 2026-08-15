@@ -149,8 +149,9 @@ jobs:
           GOAMD64: ${{ matrix.goamd64 }}
           GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
         run: |
+          set -o pipefail
           mkdir -p /tmp/textprobe && cat > /tmp/textprobe/main_test.go <<'GO'
-          package main
+          package llama_test
 
           import (
           	"fmt"
