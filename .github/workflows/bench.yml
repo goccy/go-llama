@@ -241,6 +241,9 @@ jobs:
             -cpuprofile=pp.prof .
           echo "### pp top-20 flat ###"
           go tool pprof -top -nodecount=20 go-llama.test pp.prof
+          echo "### pp hot-kernel disasm ###"
+          KERN=$(go tool pprof -top -nodecount=1 go-llama.test pp.prof | awk 'END{print $NF}')
+          go tool pprof -disasm "$KERN" go-llama.test pp.prof 2>/dev/null | awk '$1 != "." && $1 != "" {print}' | sort -k1 -rh | head -40
 
       - name: Summary
         if: always()
