@@ -61,7 +61,7 @@ jobs:
           echo "=== SIMD flags ==="
           if [ "$(uname -m)" = "x86_64" ]; then
             grep -om1 -E 'flags.*' /proc/cpuinfo | tr ' ' '\n' \
-              | grep -E '^(sse4_2|avx|avx2|avx512f|avx512bw|avx512vl|avx512vnni|avx_vnni|amx_int8)$' | sort -u \
+              | grep -E '^(sse4_2|avx|avx2|avx512f|avx512bw|avx512vl|avx512_vnni|avx512vnni|avx_vnni|amx_int8)$' | sort -u \
               | sed 's/^/  have: /' || true
           else
             grep -om1 -E 'Features.*' /proc/cpuinfo | tr ' ' '\n' \
@@ -82,17 +82,35 @@ jobs:
           curl -fSL --proto '=https' --tlsv1.2 -o "$MODEL_PATH" "$MODEL_URL"
           ls -la "$MODEL_PATH"
 
-      - name: Benchmark
+      # Candidate (the go.mod pin) and the v0.1.0 baseline run back to
+      # back IN THE SAME JOB: the amd64 runner pool mixes CPU
+      # generations (EPYC 7763 Zen 3 vs 9V74 Zen 4, ~30% apart), so
+      # only same-runner deltas are meaningful.
+      - name: Benchmark (candidate)
         env:
           GOAMD64: ${{ matrix.goamd64 }}
           GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
         run: |
-          echo "### tg (token generation) ###"
+          echo "### candidate: $(go list -m github.com/goccy/llamawasm2go) ###"
           go test -run=NONE -bench='BenchmarkDecode$' \
-            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=3 -timeout=30m . | tee tg.txt
-          echo "### pp (prompt processing) ###"
+            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=2 -timeout=30m . | tee tg.txt
           go test -run=NONE -bench='BenchmarkPromptEval$' \
-            -benchtime=${{ inputs.prompt_reps || '6' }}x -count=3 -timeout=30m . | tee pp.txt
+            -benchtime=${{ inputs.prompt_reps || '6' }}x -count=1 -timeout=30m . | tee pp.txt
+
+      - name: Benchmark (v0.1.0 baseline, same runner)
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+          GOFLAGS: -mod=mod
+        run: |
+          go get github.com/goccy/llamawasm2go@v0.1.0
+          go mod tidy
+          echo "### baseline: $(go list -m github.com/goccy/llamawasm2go) ###"
+          go test -run=NONE -bench='BenchmarkDecode$' \
+            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=2 -timeout=30m . | tee tg-base.txt
+          go test -run=NONE -bench='BenchmarkPromptEval$' \
+            -benchtime=${{ inputs.prompt_reps || '6' }}x -count=1 -timeout=30m . | tee pp-base.txt
+          git checkout -- go.mod go.sum
 
       - name: CPU profile (decode)
         env:
@@ -127,6 +145,9 @@ jobs:
           {
             echo "## ${{ matrix.name }}";
             echo '```';
+            echo "candidate:";
             grep -hE 'tok/s|prompt_tok/s' tg.txt pp.txt 2>/dev/null || echo "(no results)";
+            echo "baseline v0.1.0 (same runner):";
+            grep -hE 'tok/s|prompt_tok/s' tg-base.txt pp-base.txt 2>/dev/null || echo "(no results)";
             echo '```';
           } >> "$GITHUB_STEP_SUMMARY"
