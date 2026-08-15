@@ -89,6 +89,44 @@ jobs:
       # A 4-token decode with a tight timeout: on a pathological
       # runner/bundle combination this fails in seconds with the CPU
       # model already printed, instead of wedging the long benches.
+      # Sequential-read bandwidth of this runner (GB/s). Token
+      # generation streams the whole model per token, so if this number
+      # times model size explains the tok/s, tg is DRAM-bound and no
+      # kernel change can move it.
+      - name: Memory bandwidth probe
+        timeout-minutes: 5
+        run: |
+          mkdir -p /tmp/bwprobe && cat > /tmp/bwprobe/main.go <<'GO'
+          package main
+
+          import (
+          	"fmt"
+          	"time"
+          )
+
+          func main() {
+          	const n = 1 << 27 // 1 GiB of uint64
+          	buf := make([]uint64, n)
+          	for i := range buf {
+          		buf[i] = uint64(i)
+          	}
+          	var sum uint64
+          	best := 0.0
+          	for pass := 0; pass < 5; pass++ {
+          		t := time.Now()
+          		for _, v := range buf {
+          			sum += v
+          		}
+          		gbs := 8 * float64(n) / time.Since(t).Seconds() / 1e9
+          		if gbs > best {
+          			best = gbs
+          		}
+          	}
+          	fmt.Printf("sequential read: %.2f GB/s (sum %d)\n", best, sum)
+          }
+          GO
+          cd /tmp/bwprobe && go mod init bwprobe >/dev/null && go run .
+
       - name: Quick probe (4 tokens)
         timeout-minutes: 8
         env:
