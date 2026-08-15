@@ -106,6 +106,20 @@ jobs:
           go tool pprof -top -nodecount=30 go-llama.test cpu.prof
           echo "### top-15 cumulative ###"
           go tool pprof -top -cum -nodecount=15 go-llama.test cpu.prof
+          echo "### hot-kernel disasm (per-instruction cycles) ###"
+          KERN=$(go tool pprof -top -nodecount=1 go-llama.test cpu.prof | awk 'END{print $NF}')
+          go tool pprof -disasm "$KERN" go-llama.test cpu.prof 2>/dev/null | awk '$1 != "." && $1 != "" {print}' | head -120
+
+      - name: CPU profile (prompt)
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          go test -run=NONE -bench='BenchmarkPromptEval$' \
+            -benchtime=2x -count=1 -timeout=60m \
+            -cpuprofile=pp.prof .
+          echo "### pp top-20 flat ###"
+          go tool pprof -top -nodecount=20 go-llama.test pp.prof
 
       - name: Summary
         if: always()
