@@ -86,7 +86,19 @@ jobs:
       # back IN THE SAME JOB: the amd64 runner pool mixes CPU
       # generations (EPYC 7763 Zen 3 vs 9V74 Zen 4, ~30% apart), so
       # only same-runner deltas are meaningful.
+      # A 4-token decode with a tight timeout: on a pathological
+      # runner/bundle combination this fails in seconds with the CPU
+      # model already printed, instead of wedging the long benches.
+      - name: Quick probe (4 tokens)
+        timeout-minutes: 8
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          go test -run=NONE -bench='BenchmarkDecode$' -benchtime=4x -count=1 -timeout=7m .
+
       - name: Benchmark (candidate)
+        timeout-minutes: 30
         env:
           GOAMD64: ${{ matrix.goamd64 }}
           GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
@@ -98,6 +110,7 @@ jobs:
             -benchtime=${{ inputs.prompt_reps || '6' }}x -count=1 -timeout=30m . | tee pp.txt
 
       - name: Benchmark (v0.1.0 baseline, same runner)
+        timeout-minutes: 30
         env:
           GOAMD64: ${{ matrix.goamd64 }}
           GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
