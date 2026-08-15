@@ -139,6 +139,53 @@ jobs:
         run: |
           go test -run=NONE -bench='BenchmarkDecode$' -benchtime=4x -count=1 -timeout=7m .
 
+      # Greedy text of a fixed prompt: the fast-math tile kernels are
+      # not bit-exact vs wasm, so cross-check token-level equivalence by
+      # comparing this text across runners (arm64's kernel is the
+      # long-validated reference).
+      - name: Greedy text probe
+        timeout-minutes: 10
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          mkdir -p /tmp/textprobe && cat > /tmp/textprobe/main_test.go <<'GO'
+          package main
+
+          import (
+          	"fmt"
+          	"os"
+          	"path/filepath"
+          	"testing"
+
+          	llama "github.com/goccy/go-llama"
+          )
+
+          func TestGreedyText(t *testing.T) {
+          	model := os.Getenv("GO_LLAMA_TEST_MODEL")
+          	inst, err := llama.New(llama.WithPreopenDir(filepath.Dir(model)))
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	m, err := inst.LoadModel(filepath.Base(model))
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	ctx, err := m.NewContext(llama.ContextParams{NCtx: 256})
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	res, err := ctx.Generate("The quick brown fox", llama.Params{NPredict: 24, Temperature: 0})
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	fmt.Printf("GREEDY24: %q\n", res.Text)
+          }
+          GO
+          cp /tmp/textprobe/main_test.go ./greedy_probe_test.go
+          go test -run TestGreedyText -v -count=1 . | grep -E "GREEDY24|FAIL|ok "
+          rm -f ./greedy_probe_test.go
+
       - name: Benchmark (candidate)
         timeout-minutes: 30
         env:
