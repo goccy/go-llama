@@ -57,6 +57,10 @@ jobs:
       - name: CPU capabilities
         run: |
           echo "=== uname ==="; uname -m
+          echo "=== page size / THP ==="
+          getconf PAGESIZE
+          cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+          cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
           echo "=== lscpu ==="; lscpu || true
           echo "=== SIMD flags ==="
           if [ "$(uname -m)" = "x86_64" ]; then
