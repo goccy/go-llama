@@ -43,7 +43,7 @@ func (c *Context) Stream(prompt string, p Params, onPiece func(string)) (Result,
 		return Result{}, err
 	}
 	ps := &pieceSink{onPiece: onPiece}
-	sink, err := c.model.inst.eng.NewTokenSink(ps)
+	sink, err := c.model.inst.e().NewTokenSink(ps)
 	if err != nil {
 		return Result{}, fmt.Errorf("llama: stream: install sink: %w", err)
 	}
@@ -99,7 +99,7 @@ func (c *Context) Interrupt() error {
 	if err := c.use("interrupt"); err != nil {
 		return err
 	}
-	m := c.model.inst.eng.Base()
+	m := c.model.inst.e().Base()
 	if m == nil {
 		return fmt.Errorf("llama: interrupt: engine is not running")
 	}

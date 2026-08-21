@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"sync/atomic"
 
 	bridge "github.com/goccy/go-llama/internal"
@@ -30,14 +32,29 @@ import (
 type FS = base.FS
 
 // Llama is one engine instance: llama.cpp compiled to wasm, with its own
-// linear memory and C heap. Load models into it and open contexts over them.
-// Instances are independent — several run concurrently — while within one
-// instance calls are serialised.
+// view of linear memory and its own C heap. Load models into it and open
+// contexts over them. Instances are independent — several run concurrently —
+// while within one instance calls are serialised.
+//
+// Memory an instance never writes is physically shared with the other
+// instances in the process: engines are built over copy-on-write maps of a
+// process-wide image, and instances that load a model an earlier instance
+// already loaded (same options, same path) share the weights the same way
+// instead of loading them again. Set GO_LLAMA_NO_SHARED_IMAGE to force every
+// instance onto a private allocation.
 type Llama struct {
-	eng    *bridge.Module
+	// eng is swapped exactly once — at the first LoadModel, when a shared
+	// model snapshot replaces the freshly started engine — so readers go
+	// through e() and the swap is atomic.
+	eng    atomic.Pointer[bridge.Module]
 	cfg    config
+	mu     sync.Mutex // guards the engine swap and models during LoadModel
+	models int        // models loaded into the current engine
 	closed atomic.Bool
 }
+
+// e is the engine accessor every method funnels through.
+func (l *Llama) e() *bridge.Module { return l.eng.Load() }
 
 // config holds an instance's resolved options.
 type config struct {
@@ -79,7 +96,9 @@ func WithMemoryReserve(bytes int) Option { return func(c *config) { c.memoryRese
 
 // WithMaxMemory caps linear-memory growth, so a model bigger than expected
 // fails inside the guest instead of growing the host process. Zero means the
-// wasm32 ceiling of 4 GiB.
+// engine's default ceiling: for an instance backed by a copy-on-write mapping
+// that is the 64 GiB of address space the mapping reserves (untouched pages
+// cost nothing), and for a private allocation there is no cap.
 func WithMaxMemory(bytes uint64) Option { return func(c *config) { c.maxMemoryBytes = bytes } }
 
 // New brings up an engine instance. The zero-option instance gives the guest
@@ -90,44 +109,71 @@ func New(opts ...Option) (*Llama, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	wasi := base.DefaultWASI()
-	wasi.SetEnv(cfg.env)
-	switch {
-	case cfg.fs != nil:
-		wasi.SetFS(cfg.fs)
-	case cfg.preopenDir != "":
-		wasi.SetPreopenDir(cfg.preopenDir)
-	}
-	if cfg.stdout != nil {
-		wasi.SetStdout(cfg.stdout)
-	} else {
-		wasi.SetStdout(io.Discard)
-	}
-	if cfg.stderr != nil {
-		wasi.SetStderr(cfg.stderr)
-	} else {
-		wasi.SetStderr(io.Discard)
-	}
-	eng, err := bridge.NewEngine(bridge.Options{
-		WASI:               wasi,
-		MemoryReserveBytes: cfg.memoryReserveBytes,
-		MaxMemoryBytes:     cfg.maxMemoryBytes,
-	})
+	eng, err := bridge.NewEngine(cfg.bridgeOptions(false))
 	if err != nil {
 		return nil, fmt.Errorf("llama: start engine: %w", err)
 	}
-	return &Llama{eng: eng, cfg: cfg}, nil
+	l := &Llama{cfg: cfg}
+	l.eng.Store(eng)
+	// The engine may own a copy-on-write mapping, which is not Go heap: if the
+	// instance is dropped without Close, unmap it when the GC finds it.
+	runtime.SetFinalizer(l, func(l *Llama) { l.Close() })
+	return l, nil
 }
 
-// Close releases the instance. Models and contexts opened from it must be
-// closed first; using any of them afterward is a use-after-free in the engine.
+// wasi builds the instance's WASI from its resolved options. Each engine gets
+// a fresh one — WASI carries per-engine filesystem state, so an engine swapped
+// in at LoadModel must not inherit the previous engine's.
+func (c *config) wasi(discardIO bool) *base.WasiStubs {
+	wasi := base.DefaultWASI()
+	wasi.SetEnv(c.env)
+	switch {
+	case c.fs != nil:
+		wasi.SetFS(c.fs)
+	case c.preopenDir != "":
+		wasi.SetPreopenDir(c.preopenDir)
+	}
+	if c.stdout != nil && !discardIO {
+		wasi.SetStdout(c.stdout)
+	} else {
+		wasi.SetStdout(io.Discard)
+	}
+	if c.stderr != nil && !discardIO {
+		wasi.SetStderr(c.stderr)
+	} else {
+		wasi.SetStderr(io.Discard)
+	}
+	return wasi
+}
+
+// bridgeOptions is the internal engine configuration for these options.
+// discardIO drops the caller's stdio writers — what a shared snapshot builder
+// wants, since its output belongs to no particular instance.
+func (c *config) bridgeOptions(discardIO bool) bridge.Options {
+	return bridge.Options{
+		WASI:               c.wasi(discardIO),
+		MemoryReserveBytes: c.memoryReserveBytes,
+		MaxMemoryBytes:     c.maxMemoryBytes,
+	}
+}
+
+// Close releases the instance, including the copy-on-write memory mapping when
+// the engine is backed by one. Models and contexts opened from it must be
+// closed first; using any of them afterward fails — the engine's memory is
+// gone.
 func (l *Llama) Close() error {
-	l.closed.Store(true)
+	if l.closed.Swap(true) {
+		return nil
+	}
+	runtime.SetFinalizer(l, nil)
+	if eng := l.e(); eng != nil {
+		eng.Close()
+	}
 	return nil
 }
 
 func (l *Llama) lastError() string {
-	msg, err := l.eng.LlamaWasmLastError()
+	msg, err := l.e().LlamaWasmLastError()
 	if err != nil {
 		return err.Error()
 	}
@@ -214,19 +260,46 @@ func (l *Llama) LoadModel(path string) (*Model, error) {
 		}
 		guestPath = abs
 	}
-	h, err := l.eng.LlamaModelLoad(guestPath, uint32(len(guestPath)), 0, 0)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Shared fast path: when this is the instance's first model and the
+	// filesystem configuration is keyable (a host directory, not an arbitrary
+	// FS), the process keeps one copy-on-write snapshot of a started engine
+	// with this model in memory. Every instance after the first maps it
+	// instead of loading the weights again; the first pays one extra copy of
+	// the loaded memory into the image. Any failure here falls back to the
+	// private load below.
+	if l.models == 0 && l.cfg.fs == nil {
+		key := fmt.Sprintf("dir=%q|env=%q|model=%q", l.cfg.preopenDir, l.cfg.env, guestPath)
+		snap := bridge.SharedModelSnapshot(key, l.cfg.bridgeOptions(true),
+			func(m *bridge.Module) (uint64, error) {
+				return m.LlamaModelLoad(guestPath, uint32(len(guestPath)), 0, 0)
+			})
+		if snap.Err() == nil {
+			if eng, err := bridge.NewEngineFromModelSnapshot(snap, l.cfg.bridgeOptions(false)); err == nil {
+				old := l.eng.Swap(eng)
+				old.Close()
+				l.models++
+				return &Model{inst: l, h: snap.Handle()}, nil
+			}
+		}
+	}
+
+	h, err := l.e().LlamaModelLoad(guestPath, uint32(len(guestPath)), 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("llama: load %s: %w", path, err)
 	}
 	if h == 0 {
 		return nil, fmt.Errorf("llama: load %s: %s", path, l.lastError())
 	}
+	l.models++
 	return &Model{inst: l, h: h}, nil
 }
 
 // BuildInfo reports how the embedded engine was compiled.
 func (l *Llama) BuildInfo() (Build, error) {
-	js, err := l.eng.LlamaWasmBuildInfo()
+	js, err := l.e().LlamaWasmBuildInfo()
 	if err != nil {
 		return Build{}, err
 	}
@@ -255,7 +328,7 @@ func (m *Model) Close() error {
 	if m.closed.Swap(true) {
 		return nil
 	}
-	return m.inst.eng.LlamaModelFree(m.h)
+	return m.inst.e().LlamaModelFree(m.h)
 }
 
 // Info returns the model's metadata.
@@ -263,7 +336,7 @@ func (m *Model) Info() (ModelInfo, error) {
 	if err := m.use("model info"); err != nil {
 		return ModelInfo{}, err
 	}
-	js, err := m.inst.eng.LlamaModelInfo(m.h)
+	js, err := m.inst.e().LlamaModelInfo(m.h)
 	if err != nil {
 		return ModelInfo{}, err
 	}
@@ -284,7 +357,7 @@ func (m *Model) Tokenize(text string, addSpecial, parseSpecial bool) ([]int32, e
 	if err := m.use("tokenize"); err != nil {
 		return nil, err
 	}
-	js, err := m.inst.eng.LlamaTokenize(m.h, text, uint32(len(text)), b2i(addSpecial), b2i(parseSpecial))
+	js, err := m.inst.e().LlamaTokenize(m.h, text, uint32(len(text)), b2i(addSpecial), b2i(parseSpecial))
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +380,7 @@ func (m *Model) Detokenize(tokens []int32, renderSpecial bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	js, err := m.inst.eng.LlamaDetokenize(m.h, string(raw), uint32(len(raw)), b2i(renderSpecial))
+	js, err := m.inst.e().LlamaDetokenize(m.h, string(raw), uint32(len(raw)), b2i(renderSpecial))
 	if err != nil {
 		return "", err
 	}
@@ -320,7 +393,7 @@ func (m *Model) TokenToPiece(token int32, renderSpecial bool) (string, error) {
 	if err := m.use("token_to_piece"); err != nil {
 		return "", err
 	}
-	js, err := m.inst.eng.LlamaTokenToPiece(m.h, token, b2i(renderSpecial))
+	js, err := m.inst.e().LlamaTokenToPiece(m.h, token, b2i(renderSpecial))
 	if err != nil {
 		return "", err
 	}
@@ -356,7 +429,7 @@ func (m *Model) ApplyChatTemplate(messages []Message, templateOverride string, a
 	if err != nil {
 		return "", err
 	}
-	js, err := m.inst.eng.LlamaChatApplyTemplate(m.h, string(raw), uint32(len(raw)),
+	js, err := m.inst.e().LlamaChatApplyTemplate(m.h, string(raw), uint32(len(raw)),
 		templateOverride, uint32(len(templateOverride)), b2i(addAssistant))
 	if err != nil {
 		return "", err
@@ -393,7 +466,7 @@ func (m *Model) LoadLoRA(path string) (*LoRA, error) {
 		}
 		guestPath = abs
 	}
-	h, err := m.inst.eng.LlamaLoraLoad(m.h, guestPath, uint32(len(guestPath)))
+	h, err := m.inst.e().LlamaLoraLoad(m.h, guestPath, uint32(len(guestPath)))
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +481,7 @@ func (l *LoRA) Close() error {
 	if l.closed.Swap(true) {
 		return nil
 	}
-	return l.model.inst.eng.LlamaLoraFree(l.h)
+	return l.model.inst.e().LlamaLoraFree(l.h)
 }
 
 // LoRAWeight pairs an adapter with the scale to apply it at.
@@ -435,7 +508,7 @@ func (c *Context) SetLoRA(adapters []LoRAWeight) error {
 	if err != nil {
 		return err
 	}
-	js, err := c.model.inst.eng.LlamaCtxLoraSet(c.h, string(raw), uint32(len(raw)))
+	js, err := c.model.inst.e().LlamaCtxLoraSet(c.h, string(raw), uint32(len(raw)))
 	if err != nil {
 		return err
 	}
@@ -460,7 +533,7 @@ func (m *Model) NewContext(p ContextParams) (*Context, error) {
 	if err != nil {
 		return nil, err
 	}
-	h, err := m.inst.eng.LlamaCtxNew(m.h, string(raw), uint32(len(raw)))
+	h, err := m.inst.e().LlamaCtxNew(m.h, string(raw), uint32(len(raw)))
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +541,7 @@ func (m *Model) NewContext(p ContextParams) (*Context, error) {
 		return nil, fmt.Errorf("llama: new context: %s", m.inst.lastError())
 	}
 	c := &Context{model: m, h: h}
-	if c.interruptAddr, err = m.inst.eng.LlamaCtxInterruptAddr(h); err != nil {
+	if c.interruptAddr, err = m.inst.e().LlamaCtxInterruptAddr(h); err != nil {
 		return nil, err
 	}
 	if c.interruptAddr == 0 {
@@ -491,7 +564,7 @@ func (c *Context) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-	return c.model.inst.eng.LlamaCtxFree(c.h)
+	return c.model.inst.e().LlamaCtxFree(c.h)
 }
 
 // Generate runs generation from prompt and returns the whole result.
@@ -522,7 +595,7 @@ func (c *Context) GenerateWithDraft(draft *Context, prompt string, p Params, nDr
 	if err != nil {
 		return Result{}, err
 	}
-	js, err := c.model.inst.eng.LlamaCtxGenerateSpeculative(c.h, draft.h, prompt, uint32(len(prompt)),
+	js, err := c.model.inst.e().LlamaCtxGenerateSpeculative(c.h, draft.h, prompt, uint32(len(prompt)),
 		string(raw), uint32(len(raw)), int32(nDraft), nil)
 	if err != nil {
 		return Result{}, err
@@ -542,7 +615,7 @@ func (c *Context) Reset() error {
 	if err := c.use("reset"); err != nil {
 		return err
 	}
-	return c.model.inst.eng.LlamaCtxReset(c.h)
+	return c.model.inst.e().LlamaCtxReset(c.h)
 }
 
 // Embed returns the embedding of text. The context must have been created with
@@ -551,7 +624,7 @@ func (c *Context) Embed(text string, normalize bool) ([]float32, error) {
 	if err := c.use("embed"); err != nil {
 		return nil, err
 	}
-	js, err := c.model.inst.eng.LlamaCtxEmbed(c.h, text, uint32(len(text)), b2i(normalize))
+	js, err := c.model.inst.e().LlamaCtxEmbed(c.h, text, uint32(len(text)), b2i(normalize))
 	if err != nil {
 		return nil, err
 	}
@@ -580,7 +653,7 @@ func (c *Context) Eval(text string, addSpecial, parseSpecial bool) (EvalResult, 
 	if err := c.use("eval"); err != nil {
 		return EvalResult{}, err
 	}
-	js, err := c.model.inst.eng.LlamaCtxEval(c.h, text, uint32(len(text)), b2i(addSpecial), b2i(parseSpecial))
+	js, err := c.model.inst.e().LlamaCtxEval(c.h, text, uint32(len(text)), b2i(addSpecial), b2i(parseSpecial))
 	if err != nil {
 		return EvalResult{}, err
 	}
@@ -603,7 +676,7 @@ func (c *Context) EmbedTokens(tokens []int32, normalize bool) ([]float32, error)
 	if err != nil {
 		return nil, err
 	}
-	js, err := c.model.inst.eng.LlamaCtxEmbedTokens(c.h, string(raw), uint32(len(raw)), b2i(normalize))
+	js, err := c.model.inst.e().LlamaCtxEmbedTokens(c.h, string(raw), uint32(len(raw)), b2i(normalize))
 	if err != nil {
 		return nil, err
 	}
@@ -625,7 +698,7 @@ func (c *Context) SaveState() ([]byte, error) {
 	if err := c.use("save state"); err != nil {
 		return nil, err
 	}
-	js, err := c.model.inst.eng.LlamaCtxStateSave(c.h)
+	js, err := c.model.inst.e().LlamaCtxStateSave(c.h)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +710,7 @@ func (c *Context) SaveState() ([]byte, error) {
 	if err := decode("save state", js, &out); err != nil {
 		return nil, err
 	}
-	m := c.model.inst.eng.Base()
+	m := c.model.inst.e().Base()
 	if m == nil {
 		return nil, errors.New("llama: save state: engine is not running")
 	}
@@ -666,7 +739,7 @@ func (c *Context) LoadState(state []byte) error {
 	if err := c.use("load state"); err != nil {
 		return err
 	}
-	js, err := c.model.inst.eng.LlamaCtxStateLoad(c.h, string(state), uint32(len(state)))
+	js, err := c.model.inst.e().LlamaCtxStateLoad(c.h, string(state), uint32(len(state)))
 	if err != nil {
 		return err
 	}
@@ -691,7 +764,7 @@ func (c *Context) Score(text string) (ScoreResult, error) {
 	if err := c.use("score"); err != nil {
 		return ScoreResult{}, err
 	}
-	js, err := c.model.inst.eng.LlamaCtxScore(c.h, text, uint32(len(text)))
+	js, err := c.model.inst.e().LlamaCtxScore(c.h, text, uint32(len(text)))
 	if err != nil {
 		return ScoreResult{}, err
 	}
@@ -715,7 +788,7 @@ func (c *Context) generate(prompt string, req genRequest, sink bridge.Token_Sink
 	if err != nil {
 		return Result{}, err
 	}
-	js, err := c.model.inst.eng.LlamaCtxGenerate(c.h, prompt, uint32(len(prompt)), string(raw), uint32(len(raw)), sink)
+	js, err := c.model.inst.e().LlamaCtxGenerate(c.h, prompt, uint32(len(prompt)), string(raw), uint32(len(raw)), sink)
 	if err != nil {
 		return Result{}, err
 	}

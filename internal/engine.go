@@ -94,15 +94,35 @@ var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 }
 
 // NewEngine brings up an independent engine instance: its own wasm module
-// (own linear memory / C heap), configured by opts.
+// (its own view of linear memory / C heap), configured by opts. The memory is
+// a copy-on-write map of the process-wide data-segment image when one is
+// available (see sharedengine.go), a private allocation otherwise; either way
+// the instance runs its own initialization with its own WASI.
 func NewEngine(opts Options) (m *Module, err error) {
+	img := sharedEngineImage()
+	mem, imgErr := img.Memory(memoryCeiling(opts))
+	if imgErr != nil {
+		return NewPrivateEngine(opts)
+	}
+	m = &Module{}
+	m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+		mem, img.Size())
+	m.mmapped = mem
+	if err := initEngine(m); err != nil {
+		m.Close()
+		return nil, err
+	}
+	return m, nil
+}
+
+// NewPrivateEngine is NewEngine without the shared image: the instance's
+// memory is its own allocation. The fallback when copy-on-write mapping is
+// unavailable, and what a snapshot builder uses on purpose.
+func NewPrivateEngine(opts Options) (m *Module, err error) {
 	m = &Module{}
 	env := envStubs{m: m}
 	wm := wasmifyStubs{m: m}
-	wasi := opts.WASI
-	if wasi == nil {
-		wasi = base.DefaultWASI()
-	}
+	wasi := engineWASI(opts)
 	if opts.MemoryReserveBytes > 0 {
 		m.g = wasm2go.NewWithWASIReserve(wasi, env, wm, opts.MemoryReserveBytes)
 	} else {
@@ -111,6 +131,24 @@ func NewEngine(opts Options) (m *Module, err error) {
 	if opts.MaxMemoryBytes > 0 {
 		wasm2go.SetMaxMemory(m.g, opts.MaxMemoryBytes)
 	}
+	if err := initEngine(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func engineWASI(opts Options) base.Wasi_snapshot_preview1Imports {
+	if opts.WASI != nil {
+		return opts.WASI
+	}
+	return base.DefaultWASI()
+}
+
+// initEngine runs the start section (installs the data segments — over a
+// shared image, memory.init finds them in place and leaves the pages shared)
+// and _initialize (the C++ static constructors) under a recover, so a trap in
+// a static initializer surfaces as an error rather than a panic.
+func initEngine(m *Module) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("engine init panicked: %v", r)
@@ -118,8 +156,36 @@ func NewEngine(opts Options) (m *Module, err error) {
 	}()
 	wasm2go.Initialize(m.g)
 	_ = wasm2go.WasmInit(m.g)
-	return m, nil
+	return nil
 }
+
+// Close releases the engine's memory. An engine backed by a copy-on-write
+// mapping owns that mapping — it is not Go heap, so it must be unmapped here
+// rather than left to the GC; a private allocation is simply detached for the
+// GC to reclaim. Either way the module is left memoryless, so a late call (a
+// leaked handle's finalizer, a use-after-close) errors in invoke instead of
+// touching freed pages. Idempotent.
+func (m *Module) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.g == nil || m.g.Memory == nil {
+		return
+	}
+	mem := m.mmapped
+	m.mmapped = nil
+	// Detach the module from its memory before releasing it, so a stray late
+	// call fails the invoke closed-check instead of touching unmapped pages.
+	m.g.Memory = nil
+	m.g.M = nil
+	m.g.MemSize.Store(0)
+	if mem != nil {
+		base.UnmapMemory(mem)
+	}
+}
+
+// ImageBacked reports whether this engine's memory is a copy-on-write map of
+// a shared image (data-segment or snapshot) rather than a private allocation.
+func (m *Module) ImageBacked() bool { return m.mmapped != nil }
 
 // Base returns the engine's transpiled module, for base.AccessMemory (the only
 // safe way to touch linear memory from another goroutine — an interrupt flag
