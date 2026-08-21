@@ -66,6 +66,25 @@ func memoryCeiling(opts Options) int {
 	return int(c / wasmPageSize * wasmPageSize)
 }
 
+// mapSharedMemory maps img at the largest ceiling the host accepts. The
+// default ceiling is pure address-space ambition, and Linux's heuristic
+// overcommit refuses any single writable private mapping larger than RAM+swap
+// — so halve until one fits, down to a floor. An explicit MaxMemory is a
+// contract, not an ambition: map it exactly or report why not.
+func mapSharedMemory(img *base.SharedImage, opts Options) ([]byte, error) {
+	if opts.MaxMemoryBytes > 0 {
+		return img.Memory(memoryCeiling(opts))
+	}
+	var err error
+	for c := memoryCeiling(opts); c >= 1<<30; c /= 2 {
+		var mem []byte
+		if mem, err = img.Memory(c); err == nil {
+			return mem, nil
+		}
+	}
+	return nil, err
+}
+
 // --- copy-on-write data-segment image (every engine) ------------------------
 
 // sharedEngineImage returns the process-wide data-segment image, built on
@@ -168,7 +187,7 @@ func NewEngineFromModelSnapshot(snap *ModelSnapshot, opts Options) (*Module, err
 	if snap.err != nil {
 		return nil, snap.err
 	}
-	mem, err := snap.img.Memory(memoryCeiling(opts))
+	mem, err := mapSharedMemory(snap.img, opts)
 	if err != nil {
 		return nil, err
 	}

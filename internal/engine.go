@@ -101,7 +101,7 @@ var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 // the instance runs its own initialization with its own WASI.
 func NewEngine(opts Options) (m *Module, err error) {
 	img := sharedEngineImage()
-	mem, imgErr := img.Memory(memoryCeiling(opts))
+	mem, imgErr := mapSharedMemory(img, opts)
 	if imgErr != nil {
 		return NewPrivateEngine(opts)
 	}
