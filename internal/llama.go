@@ -509,10 +509,6 @@ type Module struct {
 	// nested re-entry from inside a callback handler).
 	mu sync.Mutex
 	g  *base.Module
-	// mmapped is the copy-on-write mapping backing g's linear memory when the
-	// engine was built over a shared image; nil for a private allocation. The
-	// mapping is not Go heap — Close must unmap it.
-	mmapped []byte
 	// cbMu guards callbacks and nextCBID. RWMutex because lookup in
 	// handleCallback is hot (every host-import dispatch) while
 	// Register/Unregister are rare (typically once per lifetime of a
@@ -655,12 +651,6 @@ func initModule(opts Options) (retErr error) {
 func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.Module, wptr, wptr) (int64, error)) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.g.Memory == nil {
-		// Close unmapped the engine's memory. Turning a late call (a leaked
-		// handle's finalizer, a use-after-close) into an error here keeps it
-		// from touching unmapped pages.
-		return nil, fmt.Errorf("wasmify: engine is closed")
-	}
 	var reqPtr, reqLen wptr
 	if len(req) > 0 {
 		reqPtr = wasm2go.WasmAlloc(m.g, wptr(len(req)))

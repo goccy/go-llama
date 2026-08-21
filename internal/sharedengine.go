@@ -175,6 +175,6 @@ func NewEngineFromModelSnapshot(snap *ModelSnapshot, opts Options) (*Module, err
 	m := &Module{}
 	m.g = wasm2go.NewFromSnapshot(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
 		mem, snap.img.Size(), snap.img.Globals())
-	m.mmapped = mem
+	engineMmaps.Store(m, mem)
 	return m, nil
 }

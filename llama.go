@@ -299,6 +299,9 @@ func (l *Llama) LoadModel(path string) (*Model, error) {
 
 // BuildInfo reports how the embedded engine was compiled.
 func (l *Llama) BuildInfo() (Build, error) {
+	if l.closed.Load() {
+		return Build{}, errors.New("llama: instance is closed")
+	}
 	js, err := l.e().LlamaWasmBuildInfo()
 	if err != nil {
 		return Build{}, err
@@ -319,6 +322,9 @@ func (l *Llama) BuildInfo() (Build, error) {
 func (m *Model) use(what string) error {
 	if m.closed.Load() {
 		return fmt.Errorf("llama: %s: model is closed", what)
+	}
+	if m.inst.closed.Load() {
+		return fmt.Errorf("llama: %s: instance is closed", what)
 	}
 	return nil
 }
