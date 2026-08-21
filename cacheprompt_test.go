@@ -77,3 +77,67 @@ func TestCachePromptMatchesFreshDecode(t *testing.T) {
 		t.Errorf("replayed output diverges:\n  got  %q\n  want %q", r3.Text, want1)
 	}
 }
+
+// TestStateBlobCarriesPrefixHistory pins the composition of the two caching
+// mechanisms: a state blob carries the prefix history, so a context restored
+// with LoadState immediately reuses the shared prefix under CachePrompt
+// instead of rebuilding the cache from scratch.
+func TestStateBlobCarriesPrefixHistory(t *testing.T) {
+	m := load(t)
+	defer m.Close()
+
+	preamble := strings.Repeat("Once upon a time there was a tiny model that routed every request to the right place. ", 6)
+	p1 := preamble + "The fox asked about the moon."
+	p2 := preamble + "The bear asked about the sea."
+	params := llama.Params{NPredict: 12, Temperature: 0, CachePrompt: true}
+
+	fresh := func(p string) string {
+		t.Helper()
+		ctx, err := m.NewContext(llama.ContextParams{NCtx: 512})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ctx.Close()
+		res, err := ctx.Generate(p, llama.Params{NPredict: 12, Temperature: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Text
+	}
+	want2 := fresh(p2)
+
+	// Warm one context, snapshot it with the history inside.
+	ctx1, err := m.NewContext(llama.ContextParams{NCtx: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx1.Close()
+	if _, err := ctx1.Generate(p1, params); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := ctx1.SaveState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh context restored from the blob must reuse the preamble on its
+	// very first CachePrompt generate — no full rebuild.
+	ctx2, err := m.NewContext(llama.ContextParams{NCtx: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx2.Close()
+	if err := ctx2.LoadState(blob); err != nil {
+		t.Fatal(err)
+	}
+	r, err := ctx2.Generate(p2, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.NCached == 0 {
+		t.Error("restored context reused nothing on its first CachePrompt generate; want the shared preamble")
+	}
+	if r.Text != want2 {
+		t.Errorf("restored-context output diverges from fresh decode:\n  got  %q\n  want %q", r.Text, want2)
+	}
+}
