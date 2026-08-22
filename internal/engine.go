@@ -103,7 +103,7 @@ func NewEngine(opts Options) (m *Module, err error) {
 	img := sharedEngineImage()
 	mem, imgErr := mapSharedMemory(img, opts)
 	if imgErr != nil {
-		return NewPrivateEngine(opts)
+		return newPrivateEngine(opts)
 	}
 	m = &Module{}
 	m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
@@ -116,10 +116,14 @@ func NewEngine(opts Options) (m *Module, err error) {
 	return m, nil
 }
 
-// NewPrivateEngine is NewEngine without the shared image: the instance's
-// memory is its own allocation. The fallback when copy-on-write mapping is
-// unavailable, and what a snapshot builder uses on purpose.
-func NewPrivateEngine(opts Options) (m *Module, err error) {
+// newPrivateEngine is NewEngine without the shared image: the instance's
+// memory is its own allocation. Never a caller-facing choice — copy-on-write
+// always applies when the platform can map it (GO_LLAMA_NO_SHARED_IMAGE is
+// the debugging escape hatch): this is the automatic fallback when mapping
+// is unavailable, and what the snapshot builder uses on purpose, because a
+// builder instance is discarded after its memory is copied into the image
+// and an mmap-backed one would leak its mapping.
+func newPrivateEngine(opts Options) (m *Module, err error) {
 	m = &Module{}
 	env := envStubs{m: m}
 	wm := wasmifyStubs{m: m}

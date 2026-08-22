@@ -159,7 +159,7 @@ func buildModelSnapshot(opts Options, load func(*Module) (uint64, error)) *Model
 		// The builder engine is private on purpose: buildSharedImage copies its
 		// memory and discards the instance, and a private allocation is the Go
 		// heap's to reclaim — an image-backed builder would leak its mapping.
-		m, err := NewPrivateEngine(opts)
+		m, err := newPrivateEngine(opts)
 		if err != nil {
 			return nil, err
 		}
