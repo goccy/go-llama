@@ -21,6 +21,7 @@ package internal
 import (
 	"fmt"
 	"runtime"
+	"sync"
 
 	wasm2go "github.com/goccy/llamawasm2go"
 	"github.com/goccy/llamawasm2go/base"
@@ -94,15 +95,39 @@ var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 }
 
 // NewEngine brings up an independent engine instance: its own wasm module
-// (own linear memory / C heap), configured by opts.
+// (its own view of linear memory / C heap), configured by opts. The memory is
+// a copy-on-write map of the process-wide data-segment image when one is
+// available (see sharedengine.go), a private allocation otherwise; either way
+// the instance runs its own initialization with its own WASI.
 func NewEngine(opts Options) (m *Module, err error) {
+	img := sharedEngineImage()
+	mem, imgErr := mapSharedMemory(img, opts)
+	if imgErr != nil {
+		return newPrivateEngine(opts)
+	}
+	m = &Module{}
+	m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+		mem, img.Size())
+	engineMmaps.Store(m, mem)
+	if err := initEngine(m); err != nil {
+		m.Close()
+		return nil, err
+	}
+	return m, nil
+}
+
+// newPrivateEngine is NewEngine without the shared image: the instance's
+// memory is its own allocation. Never a caller-facing choice — copy-on-write
+// always applies when the platform can map it (GO_LLAMA_NO_SHARED_IMAGE is
+// the debugging escape hatch): this is the automatic fallback when mapping
+// is unavailable, and what the snapshot builder uses on purpose, because a
+// builder instance is discarded after its memory is copied into the image
+// and an mmap-backed one would leak its mapping.
+func newPrivateEngine(opts Options) (m *Module, err error) {
 	m = &Module{}
 	env := envStubs{m: m}
 	wm := wasmifyStubs{m: m}
-	wasi := opts.WASI
-	if wasi == nil {
-		wasi = base.DefaultWASI()
-	}
+	wasi := engineWASI(opts)
 	if opts.MemoryReserveBytes > 0 {
 		m.g = wasm2go.NewWithWASIReserve(wasi, env, wm, opts.MemoryReserveBytes)
 	} else {
@@ -111,6 +136,24 @@ func NewEngine(opts Options) (m *Module, err error) {
 	if opts.MaxMemoryBytes > 0 {
 		wasm2go.SetMaxMemory(m.g, opts.MaxMemoryBytes)
 	}
+	if err := initEngine(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func engineWASI(opts Options) base.Wasi_snapshot_preview1Imports {
+	if opts.WASI != nil {
+		return opts.WASI
+	}
+	return base.DefaultWASI()
+}
+
+// initEngine runs the start section (installs the data segments — over a
+// shared image, memory.init finds them in place and leaves the pages shared)
+// and _initialize (the C++ static constructors) under a recover, so a trap in
+// a static initializer surfaces as an error rather than a panic.
+func initEngine(m *Module) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("engine init panicked: %v", r)
@@ -118,7 +161,45 @@ func NewEngine(opts Options) (m *Module, err error) {
 	}()
 	wasm2go.Initialize(m.g)
 	_ = wasm2go.WasmInit(m.g)
-	return m, nil
+	return nil
+}
+
+// engineMmaps tracks the copy-on-write mapping backing an engine's memory.
+// This state cannot live on Module itself — the struct is defined in the
+// generated (and attestation-verified) llama.go, which hand-written code must
+// not modify — so it rides in a side table keyed by the module.
+var engineMmaps sync.Map // *Module -> []byte
+
+// Closed reports whether Close has detached the engine from its memory.
+func (m *Module) Closed() bool { return m.g == nil || m.g.Memory == nil }
+
+// Close releases the engine's memory. An engine backed by a copy-on-write
+// mapping owns that mapping — it is not Go heap, so it must be unmapped here
+// rather than left to the GC; a private allocation is simply detached for the
+// GC to reclaim. Either way the module is left memoryless, so the hand-written
+// call surfaces (which check Closed) refuse late calls instead of touching
+// freed pages. Idempotent.
+func (m *Module) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Closed() {
+		return
+	}
+	// Detach the module from its memory before releasing it, so a stray late
+	// call fails a closed-check instead of touching unmapped pages.
+	m.g.Memory = nil
+	m.g.M = nil
+	m.g.MemSize.Store(0)
+	if mem, ok := engineMmaps.LoadAndDelete(m); ok {
+		base.UnmapMemory(mem.([]byte))
+	}
+}
+
+// ImageBacked reports whether this engine's memory is a copy-on-write map of
+// a shared image (data-segment or snapshot) rather than a private allocation.
+func (m *Module) ImageBacked() bool {
+	_, ok := engineMmaps.Load(m)
+	return ok
 }
 
 // Base returns the engine's transpiled module, for base.AccessMemory (the only
@@ -179,11 +260,14 @@ func (m *Module) NewTokenSink(impl Token_SinkCallback) (Token_SinkNode, error) {
 	}
 	s := &tokenSink{ptr: readScalarAtField(resp, 1, (*pbReader).readUint64), m: m}
 	runtime.SetFinalizer(s, func(s *tokenSink) {
-		if s.ptr != 0 {
+		// A leaked sink can outlive its engine, and a panic in a finalizer
+		// goroutine is fatal — never let the guest-side free escalate.
+		defer func() { _ = recover() }()
+		if s.ptr != 0 && !s.m.Closed() {
 			b := pbAppendHandle(pbNewBuf(), 1, s.ptr)
 			_, _ = s.m.invoke(1, 2, b, wasm2go.Inv_1_2)
-			s.ptr = 0
 		}
+		s.ptr = 0
 		s.m.unregisterCB(id)
 	})
 	return s, nil
