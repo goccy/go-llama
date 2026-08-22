@@ -696,10 +696,12 @@ func (c *Context) EmbedTokens(tokens []int32, normalize bool) ([]float32, error)
 	return out.Embedding, nil
 }
 
-// SaveState serializes the context's state — KV cache and sampling RNG —
-// into a byte slice that LoadState can restore, also in a later process.
-// Save a long system prompt's state once and every future context skips
-// re-decoding it.
+// SaveState serializes the context's state — KV cache, sampling RNG and the
+// prompt-prefix history — into a byte slice that LoadState can restore, also
+// in a later process. Save a long system prompt's state once and every
+// future context skips re-decoding it: restore the blob and either continue
+// positionally (Eval-prefill style) or generate with Params.CachePrompt,
+// which picks up the saved prefix immediately.
 func (c *Context) SaveState() ([]byte, error) {
 	if err := c.use("save state"); err != nil {
 		return nil, err

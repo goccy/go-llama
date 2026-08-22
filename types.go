@@ -84,6 +84,10 @@ type Result struct {
 	// generated.
 	NPrompt  int `json:"n_prompt"`
 	NDecoded int `json:"n_decoded"`
+	// NCached is how many leading prompt tokens a Params.CachePrompt
+	// generation reused from the KV cache instead of re-decoding. Zero
+	// without CachePrompt.
+	NCached int `json:"n_cached"`
 	// NDrafted / NAccepted are GenerateWithDraft's speculation counters —
 	// how many tokens the draft proposed and how many the target accepted.
 	// Zero on a plain Generate.
@@ -150,6 +154,15 @@ type Params struct {
 	// Stop ends generation when the output first contains one of these
 	// strings — even mid-token — and the text is cut at the match.
 	Stop []string
+	// CachePrompt treats the prompt as the WHOLE intended context: the
+	// longest prefix already in the context's KV cache is kept, whatever the
+	// cache holds beyond it is dropped, and only the rest is decoded —
+	// llama.cpp server's cache_prompt. Requests that share a long constant
+	// preamble (a system prompt, a routing configuration) then pay only for
+	// the part that changed; Result.NCached reports the reuse. Off, the
+	// prompt appends at the cache's current end, which is what an
+	// Eval-prefill continuation expects.
+	CachePrompt bool
 }
 
 // genRequest is the wire form of a generation. It exists because the bridge's
@@ -172,6 +185,7 @@ type genRequest struct {
 	MirostatTau      float32 `json:"mirostat_tau"`
 	MirostatEta      float32 `json:"mirostat_eta"`
 	IgnoreEOS        int     `json:"ignore_eos"`
+	CachePrompt      int     `json:"cache_prompt,omitempty"`
 	// LogitBias is wired as [[token,bias],...] — a JSON object would
 	// stringify the token ids.
 	LogitBias [][2]float64 `json:"logit_bias,omitempty"`
@@ -202,6 +216,9 @@ func (p Params) wire() genRequest {
 	}
 	if p.IgnoreEOS {
 		req.IgnoreEOS = 1
+	}
+	if p.CachePrompt {
+		req.CachePrompt = 1
 	}
 	// The engine reads a non-negative n_predict as an exact budget, so zero
 	// would generate nothing; Params spells "no limit" as the zero value.
