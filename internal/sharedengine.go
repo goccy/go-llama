@@ -91,7 +91,7 @@ func mapSharedMemory(img *base.SharedImage, opts Options) ([]byte, error) {
 // first use. The builder runs only the start section (Initialize): instances
 // run WasmInit themselves, with their own WASI.
 func sharedEngineImage() *base.SharedImage {
-	return base.NewSharedImage(func() (g *base.Module, err error) {
+	return base.NewSharedImageInPlace(defaultMemoryCeiling, func(mem []byte) (g *base.Module, err error) {
 		if sharedImagesDisabled() {
 			return nil, fmt.Errorf("disabled by GO_LLAMA_NO_SHARED_IMAGE")
 		}
@@ -100,8 +100,13 @@ func sharedEngineImage() *base.SharedImage {
 				g, err = nil, fmt.Errorf("the engine's start section panicked: %v", r)
 			}
 		}()
+		// The builder runs directly on the image file's shared mapping (mem):
+		// every page it writes IS the image, so building costs exactly the
+		// pages the start section touches — no ceiling-sized allocation, no
+		// copy. See base.NewSharedImageInPlace.
 		m := &Module{}
-		m.g = wasm2go.NewWithWASI(base.DefaultWASI(), envStubs{m: m}, wasmifyStubs{m: m})
+		m.g = wasm2go.NewWithMemory(base.DefaultWASI(), envStubs{m: m}, wasmifyStubs{m: m},
+			mem, wasm2go.InitialMemoryBytes)
 		wasm2go.Initialize(m.g)
 		return m.g, nil
 	})
@@ -150,17 +155,20 @@ func buildModelSnapshot(opts Options, load func(*Module) (uint64, error)) *Model
 		return &ModelSnapshot{err: fmt.Errorf("disabled by GO_LLAMA_NO_SHARED_IMAGE")}
 	}
 	var handle uint64
-	img := base.NewSharedSnapshot(func() (g *base.Module, err error) {
+	img := base.NewSharedSnapshotInPlace(memoryCeiling(opts), func(mem []byte) (g *base.Module, err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				g, err = nil, fmt.Errorf("starting the engine to snapshot panicked: %v", r)
 			}
 		}()
-		// The builder engine is private on purpose: buildSharedImage copies its
-		// memory and discards the instance, and a private allocation is the Go
-		// heap's to reclaim — an image-backed builder would leak its mapping.
-		m, err := newPrivateEngine(opts)
-		if err != nil {
+		// The builder runs directly on the snapshot file's shared mapping:
+		// the engine boots and loads the model straight into the image, so
+		// the snapshot costs exactly the pages the build touches — once,
+		// file-backed — instead of a private build plus a ceiling-sized copy.
+		m := &Module{}
+		m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+			mem, wasm2go.InitialMemoryBytes)
+		if err := initEngine(m); err != nil {
 			return nil, err
 		}
 		h, err := load(m)
