@@ -19,6 +19,7 @@ import (
 	"io"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -202,6 +203,13 @@ type ContextParams struct {
 	// threads-enabled build (BuildInfo.Threads); the single-threaded wasm
 	// clamps to 1.
 	NThreads uint32
+	// NSeqMax is the number of sequences the context can hold at once. A
+	// value > 1 turns on the unified KV cache: NCtx stays the TOTAL cell
+	// budget shared by every sequence, and ScoreChoices batches its
+	// teacher-forced candidates into one decode (one sequence per candidate,
+	// all sharing the stem). Zero or 1 keeps the single-sequence default,
+	// where ScoreChoices decodes candidates one at a time.
+	NSeqMax uint32
 	// Embeddings puts the context in embedding mode, which Context.Embed
 	// requires and which disables generation.
 	Embeddings bool
@@ -219,6 +227,7 @@ type ctxRequest struct {
 	NBatch        uint32  `json:"n_batch,omitempty"`
 	NUBatch       uint32  `json:"n_ubatch,omitempty"`
 	NThreads      uint32  `json:"n_threads,omitempty"`
+	NSeqMax       uint32  `json:"n_seq_max,omitempty"`
 	Embeddings    int     `json:"embeddings,omitempty"`
 	RopeFreqBase  float32 `json:"rope_freq_base,omitempty"`
 	RopeFreqScale float32 `json:"rope_freq_scale,omitempty"`
@@ -537,6 +546,7 @@ func (m *Model) NewContext(p ContextParams) (*Context, error) {
 		NBatch:        p.NBatch,
 		NUBatch:       p.NUBatch,
 		NThreads:      p.NThreads,
+		NSeqMax:       p.NSeqMax,
 		Embeddings:    int(b2i(p.Embeddings)),
 		RopeFreqBase:  p.RopeFreqBase,
 		RopeFreqScale: p.RopeFreqScale,
@@ -789,6 +799,43 @@ func (c *Context) Score(text string) (ScoreResult, error) {
 		return ScoreResult{}, err
 	}
 	return out.ScoreResult, nil
+}
+
+// ScoreChoices scores candidate continuations of the context's CURRENT cache
+// state: for each choice it returns the negative log-likelihood of the
+// choice's tokens as the continuation of what the context has already
+// decoded. Call it right after decoding the shared stem (Eval, or a Generate
+// whose prompt just ran) — the first token of every choice is scored from
+// the live next-position logits, the rest teacher-forced. Each choice is
+// rolled back out of the KV cache before the next, so the choices never see
+// each other and the context ends exactly where it started. Choices must be
+// non-empty and must not contain newlines (the wire format separates them
+// with '\n').
+func (c *Context) ScoreChoices(choices []string) ([]ScoreResult, error) {
+	if err := c.use("score choices"); err != nil {
+		return nil, err
+	}
+	for _, ch := range choices {
+		if ch == "" || strings.ContainsRune(ch, '\n') {
+			return nil, errors.New("llama: score choices: choices must be non-empty and newline-free")
+		}
+	}
+	joined := strings.Join(choices, "\n")
+	js, err := c.model.inst.e().LlamaCtxScoreChoices(c.h, joined, uint32(len(joined)))
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		envelope
+		Scores []ScoreResult `json:"scores"`
+	}
+	if err := decode("score choices", js, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Scores) != len(choices) {
+		return nil, fmt.Errorf("llama: score choices: %d scores for %d choices", len(out.Scores), len(choices))
+	}
+	return out.Scores, nil
 }
 
 // generate is the one path into the engine's generation loop. sink is nil for
