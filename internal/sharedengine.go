@@ -205,3 +205,62 @@ func NewEngineFromModelSnapshot(snap *ModelSnapshot, opts Options) (*Module, err
 	engineMmaps.Store(m, mem)
 	return m, nil
 }
+
+// --- copy-on-write instance snapshot (prepared contexts shared) -------------
+
+// InstanceSnapshot is a copy-on-write image of a fully prepared engine:
+// model loaded, contexts created and primed with their prompt prefixes,
+// whatever else the build did. Where ModelSnapshot shares the loaded
+// weights, this shares the whole prepared instance — an engine built from
+// it starts exactly where the build stopped, so engines forked from it pay
+// only for the pages they write.
+type InstanceSnapshot struct {
+	img *base.SharedImage
+}
+
+// BuildInstanceSnapshot boots an engine directly on a snapshot image and
+// hands it to build to prepare (load a model, create and prime contexts).
+// The handles build records remain valid in every engine created from the
+// snapshot. There is no process-wide registry: the caller owns the snapshot
+// and its lifetime.
+func BuildInstanceSnapshot(opts Options, build func(*Module) error) (*InstanceSnapshot, error) {
+	if sharedImagesDisabled() {
+		return nil, fmt.Errorf("disabled by GO_LLAMA_NO_SHARED_IMAGE")
+	}
+	img := base.NewSharedSnapshotInPlace(memoryCeiling(opts), func(mem []byte) (g *base.Module, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				g, err = nil, fmt.Errorf("preparing the engine to snapshot panicked: %v", r)
+			}
+		}()
+		m := &Module{}
+		m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+			mem, wasm2go.InitialMemoryBytes)
+		if err := initEngine(m); err != nil {
+			return nil, err
+		}
+		if err := build(m); err != nil {
+			return nil, err
+		}
+		return m.g, nil
+	})
+	if err := img.Err(); err != nil {
+		return nil, err
+	}
+	return &InstanceSnapshot{img: img}, nil
+}
+
+// NewEngineFromInstanceSnapshot brings up an engine as a copy-on-write map
+// of snap: prepared contexts and all, nothing re-run. opts supplies THIS
+// engine's WASI.
+func NewEngineFromInstanceSnapshot(snap *InstanceSnapshot, opts Options) (*Module, error) {
+	mem, err := mapSharedMemory(snap.img, opts)
+	if err != nil {
+		return nil, err
+	}
+	m := &Module{}
+	m.g = wasm2go.NewFromSnapshot(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+		mem, snap.img.Size(), snap.img.Globals())
+	engineMmaps.Store(m, mem)
+	return m, nil
+}
