@@ -44,6 +44,7 @@ const (
 	midCtxNew
 	midCtxReset
 	midCtxScore
+	midCtxScoreChoices
 	midCtxStateLoad
 	midCtxStateSave
 	midDetokenize
@@ -79,21 +80,22 @@ var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 	midCtxNew:                 wasm2go.Inv_0_10,
 	midCtxReset:               wasm2go.Inv_0_11,
 	midCtxScore:               wasm2go.Inv_0_12,
-	midCtxStateLoad:           wasm2go.Inv_0_13,
-	midCtxStateSave:           wasm2go.Inv_0_14,
-	midDetokenize:             wasm2go.Inv_0_15,
-	midLoraFree:               wasm2go.Inv_0_16,
-	midLoraLoad:               wasm2go.Inv_0_17,
-	midModelFree:              wasm2go.Inv_0_18,
-	midModelInfo:              wasm2go.Inv_0_19,
-	midModelLoad:              wasm2go.Inv_0_20,
-	midModelLoadProgressAddr:  wasm2go.Inv_0_21,
-	midTokenToPiece:           wasm2go.Inv_0_22,
-	midTokenize:               wasm2go.Inv_0_23,
-	midWasmBuildInfo:          wasm2go.Inv_0_24,
-	midWasmFree:               wasm2go.Inv_0_25,
-	midWasmInit:               wasm2go.Inv_0_26,
-	midWasmLastError:          wasm2go.Inv_0_27,
+	midCtxScoreChoices:        wasm2go.Inv_0_13,
+	midCtxStateLoad:           wasm2go.Inv_0_14,
+	midCtxStateSave:           wasm2go.Inv_0_15,
+	midDetokenize:             wasm2go.Inv_0_16,
+	midLoraFree:               wasm2go.Inv_0_17,
+	midLoraLoad:               wasm2go.Inv_0_18,
+	midModelFree:              wasm2go.Inv_0_19,
+	midModelInfo:              wasm2go.Inv_0_20,
+	midModelLoad:              wasm2go.Inv_0_21,
+	midModelLoadProgressAddr:  wasm2go.Inv_0_22,
+	midTokenToPiece:           wasm2go.Inv_0_23,
+	midTokenize:               wasm2go.Inv_0_24,
+	midWasmBuildInfo:          wasm2go.Inv_0_25,
+	midWasmFree:               wasm2go.Inv_0_26,
+	midWasmInit:               wasm2go.Inv_0_27,
+	midWasmLastError:          wasm2go.Inv_0_28,
 }
 
 // NewEngine brings up an independent engine instance: its own wasm module
@@ -445,6 +447,18 @@ func (m *Module) LlamaCtxScore(ctx uint64, text string, textLen uint32) (string,
 	buf = pbAppendString(buf, 2, text)
 	buf = pbAppendUint64(buf, 3, uint64(textLen))
 	resp, err := m.invokeMethod(midCtxScore, buf)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+func (m *Module) LlamaCtxScoreChoices(ctx uint64, choices string, choicesLen uint32) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, ctx)
+	buf = pbAppendString(buf, 2, choices)
+	buf = pbAppendUint64(buf, 3, uint64(choicesLen))
+	resp, err := m.invokeMethod(midCtxScoreChoices, buf)
 	if err != nil {
 		return "", err
 	}
