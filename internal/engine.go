@@ -32,6 +32,7 @@ import (
 // the iota order must match llama.go's Inv_0_0, Inv_0_1, ... exactly.
 const (
 	midChatApplyTemplate int32 = iota
+	midCtxAttachThreadpool
 	midCtxEmbed
 	midCtxEmbedTokens
 	midCtxEval
@@ -66,32 +67,33 @@ const (
 // after a regeneration; nothing else in this file names an Inv_0_* directly.
 var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 	midChatApplyTemplate:      wasm2go.Inv_0_0,
-	midCtxEmbed:               wasm2go.Inv_0_1,
-	midCtxEmbedTokens:         wasm2go.Inv_0_2,
-	midCtxEval:                wasm2go.Inv_0_3,
-	midCtxFree:                wasm2go.Inv_0_4,
-	midCtxGenerate:            wasm2go.Inv_0_5,
-	midCtxGenerateSpeculative: wasm2go.Inv_0_6,
-	midCtxInterruptAddr:       wasm2go.Inv_0_7,
-	midCtxLoraSet:             wasm2go.Inv_0_8,
-	midCtxNew:                 wasm2go.Inv_0_9,
-	midCtxReset:               wasm2go.Inv_0_10,
-	midCtxScore:               wasm2go.Inv_0_11,
-	midCtxStateLoad:           wasm2go.Inv_0_12,
-	midCtxStateSave:           wasm2go.Inv_0_13,
-	midDetokenize:             wasm2go.Inv_0_14,
-	midLoraFree:               wasm2go.Inv_0_15,
-	midLoraLoad:               wasm2go.Inv_0_16,
-	midModelFree:              wasm2go.Inv_0_17,
-	midModelInfo:              wasm2go.Inv_0_18,
-	midModelLoad:              wasm2go.Inv_0_19,
-	midModelLoadProgressAddr:  wasm2go.Inv_0_20,
-	midTokenToPiece:           wasm2go.Inv_0_21,
-	midTokenize:               wasm2go.Inv_0_22,
-	midWasmBuildInfo:          wasm2go.Inv_0_23,
-	midWasmFree:               wasm2go.Inv_0_24,
-	midWasmInit:               wasm2go.Inv_0_25,
-	midWasmLastError:          wasm2go.Inv_0_26,
+	midCtxAttachThreadpool:    wasm2go.Inv_0_1,
+	midCtxEmbed:               wasm2go.Inv_0_2,
+	midCtxEmbedTokens:         wasm2go.Inv_0_3,
+	midCtxEval:                wasm2go.Inv_0_4,
+	midCtxFree:                wasm2go.Inv_0_5,
+	midCtxGenerate:            wasm2go.Inv_0_6,
+	midCtxGenerateSpeculative: wasm2go.Inv_0_7,
+	midCtxInterruptAddr:       wasm2go.Inv_0_8,
+	midCtxLoraSet:             wasm2go.Inv_0_9,
+	midCtxNew:                 wasm2go.Inv_0_10,
+	midCtxReset:               wasm2go.Inv_0_11,
+	midCtxScore:               wasm2go.Inv_0_12,
+	midCtxStateLoad:           wasm2go.Inv_0_13,
+	midCtxStateSave:           wasm2go.Inv_0_14,
+	midDetokenize:             wasm2go.Inv_0_15,
+	midLoraFree:               wasm2go.Inv_0_16,
+	midLoraLoad:               wasm2go.Inv_0_17,
+	midModelFree:              wasm2go.Inv_0_18,
+	midModelInfo:              wasm2go.Inv_0_19,
+	midModelLoad:              wasm2go.Inv_0_20,
+	midModelLoadProgressAddr:  wasm2go.Inv_0_21,
+	midTokenToPiece:           wasm2go.Inv_0_22,
+	midTokenize:               wasm2go.Inv_0_23,
+	midWasmBuildInfo:          wasm2go.Inv_0_24,
+	midWasmFree:               wasm2go.Inv_0_25,
+	midWasmInit:               wasm2go.Inv_0_26,
+	midWasmLastError:          wasm2go.Inv_0_27,
 }
 
 // NewEngine brings up an independent engine instance: its own wasm module
@@ -385,14 +387,25 @@ func (m *Module) LlamaCtxGenerateSpeculative(ctx uint64, draftCtx uint64, prompt
 	return readScalarAtField(resp, 1, (*pbReader).readString), nil
 }
 
-func (m *Module) LlamaCtxInterruptAddr(ctx uint64) (uint32, error) {
+func (m *Module) LlamaCtxAttachThreadpool(ctx uint64, nThreads uint32) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, ctx)
+	buf = pbAppendUint64(buf, 2, uint64(nThreads))
+	resp, err := m.invokeMethod(midCtxAttachThreadpool, buf)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+func (m *Module) LlamaCtxInterruptAddr(ctx uint64) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, ctx)
 	resp, err := m.invokeMethod(midCtxInterruptAddr, buf)
 	if err != nil {
 		return 0, err
 	}
-	return readScalarAtField(resp, 1, (*pbReader).readUint32), nil
+	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
 }
 
 func (m *Module) LlamaCtxLoraSet(ctx uint64, adaptersJson string, adaptersJsonLen uint32) (string, error) {
@@ -522,13 +535,13 @@ func (m *Module) LlamaModelLoad(path string, pathLen uint32, nGpuLayers int32, u
 	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
 }
 
-func (m *Module) LlamaModelLoadProgressAddr() (uint32, error) {
+func (m *Module) LlamaModelLoadProgressAddr() (uint64, error) {
 	buf := pbNewBuf()
 	resp, err := m.invokeMethod(midModelLoadProgressAddr, buf)
 	if err != nil {
 		return 0, err
 	}
-	return readScalarAtField(resp, 1, (*pbReader).readUint32), nil
+	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
 }
 
 func (m *Module) LlamaTokenToPiece(model uint64, token int32, renderSpecial int32) (string, error) {

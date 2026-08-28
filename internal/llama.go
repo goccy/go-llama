@@ -981,13 +981,36 @@ func LlamaChatApplyTemplate(model uint64, messagesJson string, messagesJsonLen u
 	return readScalarAtField(resp, 1, (*pbReader).readString), nil
 }
 
+// Rebuild and attach the context's ggml threadpool. An instance forked
+//
+//	from a snapshot inherits the memory image of a context whose pool
+//	references worker threads of the snapshot builder; those threads do not
+//	exist in this process, so the next decode (or the join inside
+//	llama_ctx_free) would wait forever. Call this right after forking: it
+//	creates a fresh pool with n_threads workers (poll=0, as llama_ctx_new)
+//	and attaches it, ABANDONING the inherited pool struct -- its memory is
+//	shared snapshot pages and its dead threads cannot be joined. n_threads
+//
+// <
+// = 1 detaches instead. Returns {"ok":true} or an error object.
+func LlamaCtxAttachThreadpool(ctx uint64, nThreads uint32) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, ctx)
+	buf = pbAppendUint64(buf, 2, uint64(nThreads))
+	resp, err := invokeMethod(0, 1, buf, wasm2go.Inv_0_1)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
 func LlamaCtxEmbed(ctx uint64, text string, textLen uint32, normalize int32) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, ctx)
 	buf = pbAppendString(buf, 2, text)
 	buf = pbAppendUint64(buf, 3, uint64(textLen))
 	buf = pbAppendInt32(buf, 4, normalize)
-	resp, err := invokeMethod(0, 1, buf, wasm2go.Inv_0_1)
+	resp, err := invokeMethod(0, 2, buf, wasm2go.Inv_0_2)
 	if err != nil {
 		return "", err
 	}
@@ -1002,7 +1025,7 @@ func LlamaCtxEmbedTokens(ctx uint64, tokensJson string, tokensJsonLen uint32, no
 	buf = pbAppendString(buf, 2, tokensJson)
 	buf = pbAppendUint64(buf, 3, uint64(tokensJsonLen))
 	buf = pbAppendInt32(buf, 4, normalize)
-	resp, err := invokeMethod(0, 2, buf, wasm2go.Inv_0_2)
+	resp, err := invokeMethod(0, 3, buf, wasm2go.Inv_0_3)
 	if err != nil {
 		return "", err
 	}
@@ -1021,7 +1044,7 @@ func LlamaCtxEval(ctx uint64, text string, textLen uint32, addSpecial int32, par
 	buf = pbAppendUint64(buf, 3, uint64(textLen))
 	buf = pbAppendInt32(buf, 4, addSpecial)
 	buf = pbAppendInt32(buf, 5, parseSpecial)
-	resp, err := invokeMethod(0, 3, buf, wasm2go.Inv_0_3)
+	resp, err := invokeMethod(0, 4, buf, wasm2go.Inv_0_4)
 	if err != nil {
 		return "", err
 	}
@@ -1032,7 +1055,7 @@ func LlamaCtxEval(ctx uint64, text string, textLen uint32, addSpecial int32, par
 func LlamaCtxFree(ctx uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, ctx)
-	_, err := invokeMethod(0, 4, buf, wasm2go.Inv_0_4)
+	_, err := invokeMethod(0, 5, buf, wasm2go.Inv_0_5)
 	return err
 }
 
@@ -1075,7 +1098,7 @@ func LlamaCtxGenerate(ctx uint64, prompt string, promptLen uint32, paramsJson st
 	buf = pbAppendString(buf, 4, paramsJson)
 	buf = pbAppendUint64(buf, 5, uint64(paramsJsonLen))
 	buf = pbAppendHandlePtr(buf, 6, sink)
-	resp, err := invokeMethod(0, 5, buf, wasm2go.Inv_0_5)
+	resp, err := invokeMethod(0, 6, buf, wasm2go.Inv_0_6)
 	if err != nil {
 		return "", err
 	}
@@ -1102,7 +1125,7 @@ func LlamaCtxGenerateSpeculative(ctx uint64, draftCtx uint64, prompt string, pro
 	buf = pbAppendUint64(buf, 6, uint64(paramsJsonLen))
 	buf = pbAppendInt32(buf, 7, nDraft)
 	buf = pbAppendHandlePtr(buf, 8, sink)
-	resp, err := invokeMethod(0, 6, buf, wasm2go.Inv_0_6)
+	resp, err := invokeMethod(0, 7, buf, wasm2go.Inv_0_7)
 	if err != nil {
 		return "", err
 	}
@@ -1113,14 +1136,14 @@ func LlamaCtxGenerateSpeculative(ctx uint64, draftCtx uint64, prompt string, pro
 // Writing a non-zero value from another thread makes the running
 // llama_ctx_generate stop at its next token and return what it has, with
 // `"interrupted":true`. The generation loop clears the flag when it starts.
-func LlamaCtxInterruptAddr(ctx uint64) (uint32, error) {
+func LlamaCtxInterruptAddr(ctx uint64) (uint64, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, ctx)
-	resp, err := invokeMethod(0, 7, buf, wasm2go.Inv_0_7)
+	resp, err := invokeMethod(0, 8, buf, wasm2go.Inv_0_8)
 	if err != nil {
 		return 0, err
 	}
-	return readScalarAtField(resp, 1, (*pbReader).readUint32), nil
+	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
 }
 
 // Set the FULL adapter configuration of a context: `adapters_json` is
@@ -1130,7 +1153,7 @@ func LlamaCtxLoraSet(ctx uint64, adaptersJson string, adaptersJsonLen uint32) (s
 	buf = pbAppendUint64(buf, 1, ctx)
 	buf = pbAppendString(buf, 2, adaptersJson)
 	buf = pbAppendUint64(buf, 3, uint64(adaptersJsonLen))
-	resp, err := invokeMethod(0, 8, buf, wasm2go.Inv_0_8)
+	resp, err := invokeMethod(0, 9, buf, wasm2go.Inv_0_9)
 	if err != nil {
 		return "", err
 	}
@@ -1152,7 +1175,7 @@ func LlamaCtxNew(model uint64, paramsJson string, paramsJsonLen uint32) (uint64,
 	buf = pbAppendUint64(buf, 1, model)
 	buf = pbAppendString(buf, 2, paramsJson)
 	buf = pbAppendUint64(buf, 3, uint64(paramsJsonLen))
-	resp, err := invokeMethod(0, 9, buf, wasm2go.Inv_0_9)
+	resp, err := invokeMethod(0, 10, buf, wasm2go.Inv_0_10)
 	if err != nil {
 		return 0, err
 	}
@@ -1163,7 +1186,7 @@ func LlamaCtxNew(model uint64, paramsJson string, paramsJsonLen uint32) (uint64,
 func LlamaCtxReset(ctx uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, ctx)
-	_, err := invokeMethod(0, 10, buf, wasm2go.Inv_0_10)
+	_, err := invokeMethod(0, 11, buf, wasm2go.Inv_0_11)
 	return err
 }
 
@@ -1182,7 +1205,7 @@ func LlamaCtxScore(ctx uint64, text string, textLen uint32) (string, error) {
 	buf = pbAppendUint64(buf, 1, ctx)
 	buf = pbAppendString(buf, 2, text)
 	buf = pbAppendUint64(buf, 3, uint64(textLen))
-	resp, err := invokeMethod(0, 11, buf, wasm2go.Inv_0_11)
+	resp, err := invokeMethod(0, 12, buf, wasm2go.Inv_0_12)
 	if err != nil {
 		return "", err
 	}
@@ -1200,7 +1223,7 @@ func LlamaCtxStateLoad(ctx uint64, data string, size uint32) (string, error) {
 	buf = pbAppendUint64(buf, 1, ctx)
 	buf = pbAppendString(buf, 2, data)
 	buf = pbAppendUint64(buf, 3, uint64(size))
-	resp, err := invokeMethod(0, 12, buf, wasm2go.Inv_0_12)
+	resp, err := invokeMethod(0, 13, buf, wasm2go.Inv_0_13)
 	if err != nil {
 		return "", err
 	}
@@ -1216,7 +1239,7 @@ func LlamaCtxStateLoad(ctx uint64, data string, size uint32) (string, error) {
 func LlamaCtxStateSave(ctx uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, ctx)
-	resp, err := invokeMethod(0, 13, buf, wasm2go.Inv_0_13)
+	resp, err := invokeMethod(0, 14, buf, wasm2go.Inv_0_14)
 	if err != nil {
 		return "", err
 	}
@@ -1231,7 +1254,7 @@ func LlamaDetokenize(model uint64, tokensJson string, tokensJsonLen uint32, rend
 	buf = pbAppendString(buf, 2, tokensJson)
 	buf = pbAppendUint64(buf, 3, uint64(tokensJsonLen))
 	buf = pbAppendInt32(buf, 4, renderSpecial)
-	resp, err := invokeMethod(0, 14, buf, wasm2go.Inv_0_14)
+	resp, err := invokeMethod(0, 15, buf, wasm2go.Inv_0_15)
 	if err != nil {
 		return "", err
 	}
@@ -1243,7 +1266,7 @@ func LlamaDetokenize(model uint64, tokensJson string, tokensJsonLen uint32, rend
 func LlamaLoraFree(adapter uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, adapter)
-	_, err := invokeMethod(0, 15, buf, wasm2go.Inv_0_15)
+	_, err := invokeMethod(0, 16, buf, wasm2go.Inv_0_16)
 	return err
 }
 
@@ -1254,7 +1277,7 @@ func LlamaLoraLoad(model uint64, path string, pathLen uint32) (uint64, error) {
 	buf = pbAppendUint64(buf, 1, model)
 	buf = pbAppendString(buf, 2, path)
 	buf = pbAppendUint64(buf, 3, uint64(pathLen))
-	resp, err := invokeMethod(0, 16, buf, wasm2go.Inv_0_16)
+	resp, err := invokeMethod(0, 17, buf, wasm2go.Inv_0_17)
 	if err != nil {
 		return 0, err
 	}
@@ -1265,7 +1288,7 @@ func LlamaLoraLoad(model uint64, path string, pathLen uint32) (uint64, error) {
 func LlamaModelFree(model uint64) error {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, model)
-	_, err := invokeMethod(0, 17, buf, wasm2go.Inv_0_17)
+	_, err := invokeMethod(0, 18, buf, wasm2go.Inv_0_18)
 	return err
 }
 
@@ -1275,7 +1298,7 @@ func LlamaModelFree(model uint64) error {
 func LlamaModelInfo(model uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, model)
-	resp, err := invokeMethod(0, 18, buf, wasm2go.Inv_0_18)
+	resp, err := invokeMethod(0, 19, buf, wasm2go.Inv_0_19)
 	if err != nil {
 		return "", err
 	}
@@ -1297,7 +1320,7 @@ func LlamaModelLoad(path string, pathLen uint32, nGpuLayers int32, useMmap int32
 	buf = pbAppendUint64(buf, 2, uint64(pathLen))
 	buf = pbAppendInt32(buf, 3, nGpuLayers)
 	buf = pbAppendInt32(buf, 4, useMmap)
-	resp, err := invokeMethod(0, 19, buf, wasm2go.Inv_0_19)
+	resp, err := invokeMethod(0, 20, buf, wasm2go.Inv_0_20)
 	if err != nil {
 		return 0, err
 	}
@@ -1307,13 +1330,13 @@ func LlamaModelLoad(path string, pathLen uint32, nGpuLayers int32, useMmap int32
 // Address, in linear memory, of a float the loader updates with its progress
 // (0.0 .. 1.0) while llama_model_load runs. A host thread can poll it to drive
 // a progress bar. Valid for the lifetime of the wasm instance.
-func LlamaModelLoadProgressAddr() (uint32, error) {
+func LlamaModelLoadProgressAddr() (uint64, error) {
 	buf := pbNewBuf()
-	resp, err := invokeMethod(0, 20, buf, wasm2go.Inv_0_20)
+	resp, err := invokeMethod(0, 21, buf, wasm2go.Inv_0_21)
 	if err != nil {
 		return 0, err
 	}
-	return readScalarAtField(resp, 1, (*pbReader).readUint32), nil
+	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
 }
 
 // The text piece a single token renders to, as JSON `{"ok":true,"text":".."}`.
@@ -1324,7 +1347,7 @@ func LlamaTokenToPiece(model uint64, token int32, renderSpecial int32) (string, 
 	buf = pbAppendUint64(buf, 1, model)
 	buf = pbAppendInt32(buf, 2, token)
 	buf = pbAppendInt32(buf, 3, renderSpecial)
-	resp, err := invokeMethod(0, 21, buf, wasm2go.Inv_0_21)
+	resp, err := invokeMethod(0, 22, buf, wasm2go.Inv_0_22)
 	if err != nil {
 		return "", err
 	}
@@ -1341,7 +1364,7 @@ func LlamaTokenize(model uint64, text string, textLen uint32, addSpecial int32, 
 	buf = pbAppendUint64(buf, 3, uint64(textLen))
 	buf = pbAppendInt32(buf, 4, addSpecial)
 	buf = pbAppendInt32(buf, 5, parseSpecial)
-	resp, err := invokeMethod(0, 22, buf, wasm2go.Inv_0_22)
+	resp, err := invokeMethod(0, 23, buf, wasm2go.Inv_0_23)
 	if err != nil {
 		return "", err
 	}
@@ -1352,7 +1375,7 @@ func LlamaTokenize(model uint64, text string, textLen uint32, addSpecial int32, 
 // and whether this wasm was built with SIMD / threads. Diagnostics only.
 func LlamaWasmBuildInfo() (string, error) {
 	buf := pbNewBuf()
-	resp, err := invokeMethod(0, 23, buf, wasm2go.Inv_0_23)
+	resp, err := invokeMethod(0, 24, buf, wasm2go.Inv_0_24)
 	if err != nil {
 		return "", err
 	}
@@ -1362,7 +1385,7 @@ func LlamaWasmBuildInfo() (string, error) {
 // Free process-wide backend state. After this every handle is invalid.
 func LlamaWasmFree() error {
 	buf := pbNewBuf()
-	_, err := invokeMethod(0, 24, buf, wasm2go.Inv_0_24)
+	_, err := invokeMethod(0, 25, buf, wasm2go.Inv_0_25)
 	return err
 }
 
@@ -1370,7 +1393,7 @@ func LlamaWasmFree() error {
 // llama_model_load, so an embedder normally never calls it.
 func LlamaWasmInit() error {
 	buf := pbNewBuf()
-	_, err := invokeMethod(0, 25, buf, wasm2go.Inv_0_25)
+	_, err := invokeMethod(0, 26, buf, wasm2go.Inv_0_26)
 	return err
 }
 
@@ -1379,7 +1402,7 @@ func LlamaWasmInit() error {
 // this exists for the handle-returning calls, which can only signal 0.
 func LlamaWasmLastError() (string, error) {
 	buf := pbNewBuf()
-	resp, err := invokeMethod(0, 26, buf, wasm2go.Inv_0_26)
+	resp, err := invokeMethod(0, 27, buf, wasm2go.Inv_0_27)
 	if err != nil {
 		return "", err
 	}

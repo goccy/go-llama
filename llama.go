@@ -64,6 +64,11 @@ type config struct {
 	stdout, stderr     io.Writer
 	memoryReserveBytes int
 	maxMemoryBytes     uint64
+	// noSharedModel makes LoadModel load into this instance's own memory even
+	// for the first model, instead of adopting the process-wide model
+	// snapshot. Snapshot builders set it: their memory IS the image being
+	// built, and swapping engines mid-build would capture the wrong one.
+	noSharedModel bool
 }
 
 // An Option configures a Llama at New time.
@@ -237,7 +242,7 @@ type Context struct {
 	// interruptAddr is the linear-memory address of this context's interrupt
 	// flag, resolved once at creation so Interrupt never has to call into the
 	// engine — which it could not do while a generation is inside it.
-	interruptAddr uint32
+	interruptAddr uint64
 
 	closed atomic.Bool
 }
@@ -270,7 +275,7 @@ func (l *Llama) LoadModel(path string) (*Model, error) {
 	// instead of loading the weights again; the first pays one extra copy of
 	// the loaded memory into the image. Any failure here falls back to the
 	// private load below.
-	if l.models == 0 && l.cfg.fs == nil {
+	if l.models == 0 && l.cfg.fs == nil && !l.cfg.noSharedModel {
 		key := fmt.Sprintf("dir=%q|env=%q|model=%q", l.cfg.preopenDir, l.cfg.env, guestPath)
 		snap := bridge.SharedModelSnapshot(key, l.cfg.bridgeOptions(true),
 			func(m *bridge.Module) (uint64, error) {
@@ -712,7 +717,7 @@ func (c *Context) SaveState() ([]byte, error) {
 	}
 	var out struct {
 		envelope
-		Addr uint32 `json:"addr"`
+		Addr uint64 `json:"addr"`
 		Size uint32 `json:"size"`
 	}
 	if err := decode("save state", js, &out); err != nil {

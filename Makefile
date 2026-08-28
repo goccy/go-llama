@@ -1,7 +1,7 @@
 # Version of goccy/llama-wasm whose release assets this package is built from.
 # Bump it, run `make llama`, and commit the regenerated bridge.
 LLAMA_WASM_REPO     ?= goccy/llama-wasm
-LLAMA_WASM_VERSION  ?= v0.2.7
+LLAMA_WASM_VERSION  ?= v0.2.8
 LLAMA_WASM_WORKFLOW ?= goccy/llama-wasm/.github/workflows/release.yml
 
 # The generated wasm2go bridge. It is a release artifact of llama-wasm, not
