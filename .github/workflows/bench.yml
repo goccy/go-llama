@@ -27,6 +27,10 @@ on:
         description: "iterations for the pp benchmark"
         required: false
         default: "6"
+      model_url:
+        description: "Q8_0 GGUF to benchmark (blank = qwen2.5-0.5b)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -89,9 +93,13 @@ jobs:
           echo "llamawasm2go now:"; go list -m github.com/goccy/llamawasm2go
 
       - name: Fetch Q8_0 model
+        env:
+          MODEL_URL_OVERRIDE: ${{ inputs.model_url }}
         run: |
+          url="${MODEL_URL_OVERRIDE:-$MODEL_URL}"
+          echo "model: $url"
           mkdir -p testdata
-          curl -fSL --proto '=https' --tlsv1.2 -o "$MODEL_PATH" "$MODEL_URL"
+          curl -fSL --proto '=https' --tlsv1.2 -o "$MODEL_PATH" "$url"
           ls -la "$MODEL_PATH"
 
       # The comparison target: llama.cpp built natively on this very
