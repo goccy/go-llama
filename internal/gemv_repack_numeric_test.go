@@ -26,7 +26,7 @@ import (
 // recorded in the llama-wasm release build log); it moves with any
 // engine rebuild, so re-read it from the log (or the bundle's
 // load32_splat memarg offsets) when bumping the bundle dependency.
-const repackF16Table = 8793760
+const repackF16Table = 8811856
 
 func f16Bits(f float32) uint16 {
 	// Exact for the small power-of-two scales the tests use.
@@ -233,4 +233,113 @@ func TestGemvRepackActScaleAdvance(t *testing.T) {
 	}
 	h.run(64, 4)
 	assertCols(t, h, 4, func(int) float32 { return 96 })
+}
+
+// putActBlockX4 writes one block_q8_0x4 (4 interleaved activation
+// rows): 4 f16 row scales then 128 quantized bytes, laid out
+// [k 0..7][row 0..3][i 0..3] — the same interleave the weights use.
+func (h *gemvHarness) putActBlockX4(block int64, scales [4]float32, qs func(row, i int) int8) {
+	blk := h.vy + block*136
+	for r, s := range scales {
+		binary.LittleEndian.PutUint16(h.mem[blk+int64(2*r):], f16Bits(s))
+	}
+	for k := 0; k < 8; k++ {
+		for r := 0; r < 4; r++ {
+			for i := 0; i < 4; i++ {
+				h.mem[blk+8+int64(k*16+r*4+i)] = byte(qs(r, k*4+i))
+			}
+		}
+	}
+}
+
+func (h *gemvHarness) runGemm(n int32, bs, nr, nc int) {
+	wasm2go.DbgGemmQ8_0_4x4(h.g, n, h.sPtr, int64(bs), h.vx, h.vy, int32(nr), int32(nc))
+}
+
+func (h *gemvHarness) cell(row, bs, col int) float32 {
+	return math.Float32frombits(binary.LittleEndian.Uint32(h.mem[h.sPtr+int64(4*(row*bs+col)):]))
+}
+
+// TestGemmRepackNumeric drives random blocks through the batched 4x4
+// tile GEMM and checks every output cell against the reference dot
+// product. Covers the whole varying-scale surface for all four rows
+// and both column groups, the batched analogue of
+// TestGemvRepackNumeric.
+func TestGemmRepackNumeric(t *testing.T) {
+	h := newGemvHarness(t)
+	const (
+		nb = 5  // blocks per row
+		nr = 8  // output rows (2 groups of 4)
+		nc = 8  // output columns (2 groups of 4)
+		bs = 10 // row stride in floats (> nc to catch stride bugs)
+	)
+	scales := []float32{1.0, 0.5, 2.0, 0.25}
+	rng := rand.New(rand.NewSource(11))
+
+	qb := make([][][]int8, nc/4)
+	dB := make([][][]float32, nc/4)
+	for x := 0; x < nc/4; x++ {
+		qb[x] = make([][]int8, nb)
+		dB[x] = make([][]float32, nb)
+		for l := 0; l < nb; l++ {
+			var s [4]float32
+			for j := range s {
+				s[j] = scales[rng.Intn(len(scales))]
+			}
+			dB[x][l] = s[:]
+			q := make([]int8, 128)
+			for i := range q {
+				q[i] = int8(rng.Intn(255) - 127)
+			}
+			qb[x][l] = q
+			h.putWeightBlock(int64(x*nb+l), s, func(i int) int8 { return q[i] })
+		}
+	}
+	qa := make([][][]int8, nr/4) // [rowgroup][block][128]
+	dA := make([][][]float32, nr/4)
+	for y := 0; y < nr/4; y++ {
+		qa[y] = make([][]int8, nb)
+		dA[y] = make([][]float32, nb)
+		for l := 0; l < nb; l++ {
+			var s [4]float32
+			for r := range s {
+				s[r] = scales[rng.Intn(len(scales))]
+			}
+			dA[y][l] = s[:]
+			q := make([]int8, 128)
+			for i := range q {
+				q[i] = int8(rng.Intn(255) - 127)
+			}
+			qa[y][l] = q
+			h.putActBlockX4(int64(y*nb+l), s, func(row, i int) int8 { return q[row*4+(i%4)+(i/4)*16] })
+		}
+	}
+
+	// Prefill the output arena with a sentinel to catch unwritten cells.
+	for i := int64(0); i < int64(nr*bs); i++ {
+		binary.LittleEndian.PutUint32(h.mem[h.sPtr+4*i:], math.Float32bits(-999))
+	}
+	h.runGemm(nb*32, bs, nr, nc)
+
+	for row := 0; row < nr; row++ {
+		y, m := row/4, row%4
+		for col := 0; col < nc; col++ {
+			x, j := col/4, col%4
+			var want float32
+			for l := 0; l < nb; l++ {
+				sum := int32(0)
+				for k := 0; k < 8; k++ {
+					for i := 0; i < 4; i++ {
+						sum += int32(qb[x][l][k*16+j*4+i]) * int32(qa[y][l][k*16+m*4+i])
+					}
+				}
+				want += float32(sum) * dB[x][l][j] * dA[y][l][m]
+			}
+			got := h.cell(row, bs, col)
+			diff := math.Abs(float64(got - want))
+			if tol := 1e-3 * (1 + math.Abs(float64(want))); diff > tol {
+				t.Errorf("cell[%d][%d]: got %g want %g (diff %g)", row, col, got, want, diff)
+			}
+		}
+	}
 }
