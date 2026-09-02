@@ -1,0 +1,235 @@
+name: Bench
+
+# On-demand throughput benchmark for the amd64 native-gap work: it reports
+# token-generation (tg) and prompt-processing (pp) tok/s for a Q8_0 model,
+# for go-llama AND for a native llama.cpp build ON THE SAME RUNNER, so the
+# honest cost of running fully in Go can be read off directly. It also
+# prints each runner's CPU SIMD capabilities and a CPU profile with a
+# per-instruction disassembly of the hot kernel, which is what drives the
+# kernel work. Trigger with:
+#   gh workflow run bench.yml -f llamawasm2go_ref=<branch-or-version>
+# It also runs automatically on every push to a perf/** branch, benchmarking
+# whatever llamawasm2go the branch's go.mod pins — that is the dev loop.
+on:
+  push:
+    branches: ["perf/**"]
+  workflow_dispatch:
+    inputs:
+      llamawasm2go_ref:
+        description: "llamawasm2go module version or branch to benchmark (blank = go.mod pin)"
+        required: false
+        default: ""
+      decode_tokens:
+        description: "tokens to decode for the tg benchmark"
+        required: false
+        default: "48"
+      prompt_reps:
+        description: "iterations for the pp benchmark"
+        required: false
+        default: "6"
+
+permissions:
+  contents: read
+
+env:
+  # The Q8_0 model whose vec_dot kernel the SIMD work targets. Small enough to
+  # fetch per run, quantized so it exercises the integer dot path.
+  MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+  MODEL_PATH: testdata/qwen2.5-0.5b-instruct-q8_0.gguf
+
+jobs:
+  bench:
+    name: Bench (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            runner: ubuntu-latest
+            goamd64: v2
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            goamd64: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: CPU capabilities
+        run: |
+          echo "=== uname ==="; uname -m
+          echo "=== page size / THP ==="
+          getconf PAGESIZE
+          cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+          echo "=== lscpu ==="; lscpu || true
+          echo "=== SIMD flags ==="
+          if [ "$(uname -m)" = "x86_64" ]; then
+            grep -om1 -E 'flags.*' /proc/cpuinfo | tr ' ' '\n' \
+              | grep -E '^(sse4_2|avx|avx2|f16c|fma|avx512f|avx512bw|avx512vl|avx512_vnni|avx512vnni|avx_vnni|amx_int8)$' | sort -u \
+              | sed 's/^/  have: /' || true
+          else
+            grep -om1 -E 'Features.*' /proc/cpuinfo | tr ' ' '\n' \
+              | grep -E '^(asimd|asimddp|i8mm|sve|sve2|bf16)$' | sort -u \
+              | sed 's/^/  have: /' || true
+          fi
+
+      - name: Point at a llamawasm2go ref
+        if: ${{ inputs.llamawasm2go_ref != '' }}
+        run: |
+          go get github.com/goccy/llamawasm2go@${{ inputs.llamawasm2go_ref }}
+          go mod tidy
+          echo "llamawasm2go now:"; go list -m github.com/goccy/llamawasm2go
+
+      - name: Fetch Q8_0 model
+        run: |
+          mkdir -p testdata
+          curl -fSL --proto '=https' --tlsv1.2 -o "$MODEL_PATH" "$MODEL_URL"
+          ls -la "$MODEL_PATH"
+
+      # The comparison target: llama.cpp built natively on this very
+      # runner (-march=native equivalent via GGML_NATIVE), CPU backend
+      # only. The commit is printed so drift between runs is visible.
+      - name: Build native llama.cpp
+        timeout-minutes: 25
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp /tmp/llama.cpp
+          cd /tmp/llama.cpp
+          echo "llama.cpp commit: $(git rev-parse HEAD)"
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON \
+            -DLLAMA_CURL=OFF >/dev/null
+          cmake --build build --target llama-bench -j "$(nproc)" 2>&1 | tail -3
+          ls -la build/bin/llama-bench
+
+      # Native throughput on the same runner and model. -t 1 matches the
+      # engine's single-threaded execution (the kernel-efficiency
+      # comparison); -t nproc shows the full-machine native ceiling.
+      - name: Native llama-bench (same runner)
+        timeout-minutes: 20
+        run: |
+          BENCH=/tmp/llama.cpp/build/bin/llama-bench
+          echo "### native llama.cpp, 1 thread ###"
+          "$BENCH" -m "$MODEL_PATH" -p 512 -n 64 -t 1 -r 2 2>/dev/null | tee native-t1.txt
+          echo "### native llama.cpp, $(nproc) threads ###"
+          "$BENCH" -m "$MODEL_PATH" -p 512 -n 64 -t "$(nproc)" -r 2 2>/dev/null | tee native-tn.txt
+
+      # A 4-token decode with a tight timeout: on a pathological
+      # runner/bundle combination this fails in seconds with the CPU
+      # model already printed, instead of wedging the long benches.
+      - name: Quick probe (4 tokens)
+        timeout-minutes: 8
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          go test -run=NONE -bench='BenchmarkDecode$' -benchtime=4x -count=1 -timeout=7m .
+
+      # Greedy text of a fixed prompt: the fast-math tile kernels are
+      # not bit-exact vs wasm, so cross-check token-level equivalence by
+      # comparing this text across runners (arm64's kernel is the
+      # long-validated reference).
+      - name: Greedy text probe
+        timeout-minutes: 10
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/textprobe && cat > /tmp/textprobe/main_test.go <<'GO'
+          package llama_test
+
+          import (
+          	"fmt"
+          	"os"
+          	"path/filepath"
+          	"testing"
+
+          	llama "github.com/goccy/go-llama"
+          )
+
+          func TestGreedyText(t *testing.T) {
+          	model := os.Getenv("GO_LLAMA_TEST_MODEL")
+          	inst, err := llama.New(llama.WithPreopenDir(filepath.Dir(model)))
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	m, err := inst.LoadModel(filepath.Base(model))
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	ctx, err := m.NewContext(llama.ContextParams{NCtx: 256})
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	res, err := ctx.Generate("The quick brown fox", llama.Params{NPredict: 24, Temperature: 0})
+          	if err != nil {
+          		t.Fatal(err)
+          	}
+          	fmt.Printf("GREEDY24: %q\n", res.Text)
+          }
+          GO
+          cp /tmp/textprobe/main_test.go ./greedy_probe_test.go
+          go test -run TestGreedyText -v -count=1 . | grep -E "GREEDY24|FAIL|ok "
+          rm -f ./greedy_probe_test.go
+
+      - name: Benchmark (go-llama)
+        timeout-minutes: 30
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          echo "### go-llama engine: $(go list -m github.com/goccy/llamawasm2go) ###"
+          go test -run=NONE -bench='BenchmarkDecode$' \
+            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=2 -timeout=30m . | tee tg.txt
+          go test -run=NONE -bench='BenchmarkPromptEval$' \
+            -benchtime=${{ inputs.prompt_reps || '6' }}x -count=1 -timeout=30m . | tee pp.txt
+
+      - name: CPU profile (decode)
+        timeout-minutes: 30
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          go test -run=NONE -bench='BenchmarkDecode$' \
+            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=1 -timeout=30m \
+            -cpuprofile=cpu.prof .
+          echo "### tg top-30 flat ###"
+          go tool pprof -top -nodecount=30 go-llama.test cpu.prof
+          echo "### tg top-15 cumulative ###"
+          go tool pprof -top -cum -nodecount=15 go-llama.test cpu.prof
+          echo "### tg hot-kernel disasm (per-instruction cycles) ###"
+          KERN=$(go tool pprof -top -nodecount=1 go-llama.test cpu.prof | awk 'END{print $NF}')
+          go tool pprof -disasm "$KERN" go-llama.test cpu.prof 2>/dev/null | awk '$1 != "." && $1 != "" {print}' | head -120
+
+      - name: CPU profile (prompt)
+        timeout-minutes: 60
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          go test -run=NONE -bench='BenchmarkPromptEval$' \
+            -benchtime=2x -count=1 -timeout=60m \
+            -cpuprofile=pp.prof .
+          echo "### pp top-20 flat ###"
+          go tool pprof -top -nodecount=20 go-llama.test pp.prof
+          echo "### pp hot-kernel disasm ###"
+          KERN=$(go tool pprof -top -nodecount=1 go-llama.test pp.prof | awk 'END{print $NF}')
+          go tool pprof -disasm "$KERN" go-llama.test pp.prof 2>/dev/null | awk '$1 != "." && $1 != "" {print}' | sort -k1 -rh | head -40
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.name }}";
+            echo '```';
+            echo "go-llama ($(go list -m github.com/goccy/llamawasm2go 2>/dev/null)):";
+            grep -hE 'tok/s|prompt_tok/s' tg.txt pp.txt 2>/dev/null || echo "(no results)";
+            echo;
+            echo "native llama.cpp, 1 thread (same runner):";
+            grep -hE 'pp512|tg64' native-t1.txt 2>/dev/null || echo "(no results)";
+            echo;
+            echo "native llama.cpp, all threads (same runner):";
+            grep -hE 'pp512|tg64' native-tn.txt 2>/dev/null || echo "(no results)";
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
