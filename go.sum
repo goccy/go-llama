@@ -1,2 +1,2 @@
-github.com/goccy/llamawasm2go v0.2.6-0.20260902043553-8b00acde598c h1:JLJHMu6nVi+TxgJ53WTY1HqIB+R8ny/gE1zRjFZRVs4=
-github.com/goccy/llamawasm2go v0.2.6-0.20260902043553-8b00acde598c/go.mod h1:2RraXBB/RS2RBlIol/M/rNvIcdtatKWzt8g7q63MPm0=
+github.com/goccy/llamawasm2go v0.2.6-0.20260902051004-e32be00f16dc h1:MkXojyTDPY/dY7MVHrz0o/1Cudc20Gzs8fNYwkDVE+c=
+github.com/goccy/llamawasm2go v0.2.6-0.20260902051004-e32be00f16dc/go.mod h1:2RraXBB/RS2RBlIol/M/rNvIcdtatKWzt8g7q63MPm0=
