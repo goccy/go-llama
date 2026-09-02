@@ -31,6 +31,12 @@ on:
 permissions:
   contents: read
 
+# Iteration pushes supersede each other: only the newest bench per
+# branch matters, so cancel the stale one.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # The Q8_0 model whose vec_dot kernel the SIMD work targets. Small enough to
   # fetch per run, quantized so it exercises the integer dot path.
@@ -170,7 +176,7 @@ jobs:
           }
           GO
           cp /tmp/textprobe/main_test.go ./greedy_probe_test.go
-          go test -run TestGreedyText -v -count=1 . | grep -E "GREEDY24|FAIL|ok "
+          go test -run TestGreedyText -v -count=1 . | grep -E "GREEDY24|FAIL|ok " | tee greedy.txt
           rm -f ./greedy_probe_test.go
 
       - name: Benchmark (go-llama)
@@ -185,6 +191,30 @@ jobs:
           go test -run=NONE -bench='BenchmarkPromptEval$' \
             -benchtime=${{ inputs.prompt_reps || '6' }}x -count=1 -timeout=30m . | tee pp.txt
 
+      # Same-runner A/B: the pool mixes CPU generations (Zen 3 / Zen 4 /
+      # several Intels, ~30%+ apart), so only a delta measured on THIS
+      # runner is meaningful. The baseline is the v0.3.0 release engine.
+      - name: Benchmark (v0.3.0 baseline, same runner)
+        timeout-minutes: 60
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+          GOFLAGS: -mod=mod
+        run: |
+          go get github.com/goccy/llamawasm2go@v0.3.0
+          go mod tidy
+          echo "### baseline: $(go list -m github.com/goccy/llamawasm2go) ###"
+          go test -run=NONE -bench='BenchmarkDecode$' \
+            -benchtime=${{ inputs.decode_tokens || '48' }}x -count=2 -timeout=30m . | tee tg-base.txt
+          go test -run=NONE -bench='BenchmarkPromptEval$' \
+            -benchtime=3x -count=1 -timeout=55m . | tee pp-base.txt
+          git checkout -- go.mod go.sum
+
+      # The profile runs keep the compiled test binary (-o): together
+      # with the raw .prof files in the run artifact it lets ANY
+      # function be pprof-disasm'd/-list'ed locally after `gh run
+      # download`, so one CI run answers every profiling question of
+      # the iteration — the logs below only carry the highlights.
       - name: CPU profile (decode)
         timeout-minutes: 30
         env:
@@ -193,7 +223,7 @@ jobs:
         run: |
           go test -run=NONE -bench='BenchmarkDecode$' \
             -benchtime=${{ inputs.decode_tokens || '48' }}x -count=1 -timeout=30m \
-            -cpuprofile=cpu.prof .
+            -cpuprofile=cpu.prof -o go-llama.test .
           echo "### tg top-30 flat ###"
           go tool pprof -top -nodecount=30 go-llama.test cpu.prof
           echo "### tg top-15 cumulative ###"
@@ -210,12 +240,34 @@ jobs:
         run: |
           go test -run=NONE -bench='BenchmarkPromptEval$' \
             -benchtime=2x -count=1 -timeout=60m \
-            -cpuprofile=pp.prof .
+            -cpuprofile=pp.prof -o go-llama.test .
           echo "### pp top-20 flat ###"
           go tool pprof -top -nodecount=20 go-llama.test pp.prof
           echo "### pp hot-kernel disasm ###"
           KERN=$(go tool pprof -top -nodecount=1 go-llama.test pp.prof | awk 'END{print $NF}')
           go tool pprof -disasm "$KERN" go-llama.test pp.prof 2>/dev/null | awk '$1 != "." && $1 != "" {print}' | sort -k1 -rh | head -40
+
+      # Everything an offline analysis needs, per matrix arch:
+      #   gh run download <run-id> -n bench-<arch>
+      #   go tool pprof -disasm <Fn> go-llama.test cpu.prof
+      - name: Upload profiles and outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.name }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            cpu.prof
+            pp.prof
+            go-llama.test
+            tg.txt
+            pp.txt
+            native-t1.txt
+            native-tn.txt
+            greedy.txt
+            tg-base.txt
+            pp-base.txt
 
       - name: Summary
         if: always()
@@ -225,6 +277,9 @@ jobs:
             echo '```';
             echo "go-llama ($(go list -m github.com/goccy/llamawasm2go 2>/dev/null)):";
             grep -hE 'tok/s|prompt_tok/s' tg.txt pp.txt 2>/dev/null || echo "(no results)";
+            echo;
+            echo "baseline v0.3.0 (same runner):";
+            grep -hE 'tok/s|prompt_tok/s' tg-base.txt pp-base.txt 2>/dev/null || echo "(no results)";
             echo;
             echo "native llama.cpp, 1 thread (same runner):";
             grep -hE 'pp512|tg64' native-t1.txt 2>/dev/null || echo "(no results)";
