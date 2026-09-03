@@ -87,7 +87,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: native/llama-bench
-          key: llama-bench-${{ env.LLAMA_CPP_COMMIT }}-${{ matrix.name }}-${{ runner.os }}
+          # "static" in the key: the cached binary must not depend on the
+          # build tree (a dynamically linked llama-bench restored without
+          # its libllama/libggml .so files fails with exit 127).
+          key: llama-bench-static-${{ env.LLAMA_CPP_COMMIT }}-${{ matrix.name }}-${{ runner.os }}
       - name: Build native llama.cpp at the engine's commit
         if: steps.native-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
@@ -95,9 +98,15 @@ jobs:
           mkdir -p /tmp/llama.cpp native && cd /tmp/llama.cpp
           git init -q && git remote add origin https://github.com/ggml-org/llama.cpp
           git fetch -q --depth 1 origin "$LLAMA_CPP_COMMIT" && git checkout -q FETCH_HEAD
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF >/dev/null
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF \
+            -DBUILD_SHARED_LIBS=OFF >/dev/null
           cmake --build build --target llama-bench -j "$(nproc)" 2>&1 | tail -2
           cp build/bin/llama-bench "$GITHUB_WORKSPACE/native/llama-bench"
+      - name: Native binary sanity (runs without the build tree)
+        run: |
+          file native/llama-bench || true
+          ldd native/llama-bench 2>&1 | grep -iE "llama|ggml|not found" || true
+          native/llama-bench --help >/dev/null
 
       - name: Native llama-bench (same runner, ${{ env.NATIVE_THREADS }} thread)
         timeout-minutes: 20
