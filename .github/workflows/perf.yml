@@ -1,0 +1,135 @@
+name: Perf gate
+
+# Throughput of go-llama RELATIVE TO a native llama.cpp build measured
+# back to back on the same runner, for arm64 and amd64, gated against
+# the recorded baseline in bench/baseline.json: a change that lowers the
+# go/native ratio of tg (decode) or pp (prompt) by more than
+# PERF_THRESHOLD fails the job. The ratio cancels the runner-to-runner
+# speed spread of the CI pool; raw tok/s are reported for reference.
+#
+# Moving the bar is a deliberate commit: download the job's
+# perf-<arch> artifact and run
+#   go run ./internal/cmd/perfgate baseline -baseline bench/baseline.json -result result.json
+# (see bench/README.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The Q8_0 model the engine's kernels are tuned for; cached per URL.
+  MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+  MODEL_PATH: testdata/qwen2.5-0.5b-instruct-q8_0.gguf
+  # The native reference is the SAME llama.cpp commit the engine was
+  # built from (goccy/llama-wasm's llama.cpp submodule at the release
+  # go.mod pins) — bump it together with the llamawasm2go dependency.
+  LLAMA_CPP_COMMIT: 11924d4c17abc27383376a1ac6a24fa3e36c1c0c
+  # The bridge runs ggml single-threaded unless a context asks for more
+  # (n_threads defaults to 1), so native is measured with one thread too.
+  NATIVE_THREADS: "1"
+  PERF_THRESHOLD: "0.10"
+  DECODE_TOKENS: "64"
+  PROMPT_REPS: "3"
+  BENCH_COUNT: "3"
+
+jobs:
+  perf:
+    name: Perf vs native (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            runner: ubuntu-latest
+            goamd64: v2
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            goamd64: ""
+    env:
+      GOAMD64: ${{ matrix.goamd64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Runner CPU
+        id: cpu
+        run: |
+          model=$(lscpu | awk -F: '/Model name/ {gsub(/^ +/, "", $2); print $2; exit}')
+          echo "model=${model:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "cpu: ${model:-unknown} ($(nproc) cores)"
+
+      - name: Cache model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: model-${{ hashFiles('.github/workflows/perf.yml') }}-${{ env.MODEL_URL }}
+      - name: Fetch model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p testdata
+          curl -fSL --proto '=https' --tlsv1.2 -o "$MODEL_PATH" "$MODEL_URL"
+
+      - name: Cache native llama-bench
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: native/llama-bench
+          key: llama-bench-${{ env.LLAMA_CPP_COMMIT }}-${{ matrix.name }}-${{ runner.os }}
+      - name: Build native llama.cpp at the engine's commit
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 30
+        run: |
+          mkdir -p /tmp/llama.cpp native && cd /tmp/llama.cpp
+          git init -q && git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_CPP_COMMIT" && git checkout -q FETCH_HEAD
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF >/dev/null
+          cmake --build build --target llama-bench -j "$(nproc)" 2>&1 | tail -2
+          cp build/bin/llama-bench "$GITHUB_WORKSPACE/native/llama-bench"
+
+      - name: Native llama-bench (same runner, ${{ env.NATIVE_THREADS }} thread)
+        timeout-minutes: 20
+        run: |
+          native/llama-bench -m "$MODEL_PATH" -p 512 -n "$DECODE_TOKENS" -t "$NATIVE_THREADS" -r "$BENCH_COUNT" -o json 2>/dev/null > native.json
+          native/llama-bench -m "$MODEL_PATH" -p 512 -n "$DECODE_TOKENS" -t "$NATIVE_THREADS" -r "$BENCH_COUNT" 2>/dev/null
+
+      - name: go-llama benchmarks
+        timeout-minutes: 45
+        env:
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          echo "engine: $(go list -m github.com/goccy/llamawasm2go)"
+          go test -run=NONE -bench='BenchmarkDecode$' -benchtime="${DECODE_TOKENS}x" -count="$BENCH_COUNT" -timeout=40m . | tee tg.txt
+          go test -run=NONE -bench='BenchmarkPromptEval$' -benchtime="${PROMPT_REPS}x" -count="$BENCH_COUNT" -timeout=40m . | tee pp.txt
+
+      - name: Compare against the baseline
+        run: |
+          go run ./internal/cmd/perfgate compare \
+            -arch "${{ matrix.name }}" -native native.json -tg tg.txt -pp pp.txt \
+            -baseline bench/baseline.json -out result.json -threshold "$PERF_THRESHOLD" \
+            -summary "$GITHUB_STEP_SUMMARY" \
+            -engine "$(go list -m github.com/goccy/llamawasm2go)" -llama-cpp "$LLAMA_CPP_COMMIT" \
+            -cpu "${{ steps.cpu.outputs.model }}" \
+            -run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-${{ matrix.name }}
+          path: |
+            result.json
+            native.json
+            tg.txt
+            pp.txt
