@@ -199,6 +199,80 @@ jobs:
           go test -run=NONE -bench='BenchmarkPromptEval$' \
             -benchtime=${{ inputs.prompt_reps || '6' }}x -count=1 -timeout=30m . | tee pp.txt
 
+      - name: Engine feature detection
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+        run: |
+          mkdir -p featprobe
+          cat > featprobe/main_amd64.go <<'EOF2'
+          package main
+
+          import (
+          	"fmt"
+
+          	"github.com/goccy/llamawasm2go/base"
+          )
+
+          func cpuid(eax, ecx uint32) (a, b, c, d uint32)
+          func xgetbv() (lo, hi uint32)
+
+          func main() {
+          	_, b7, c7, _ := cpuid(7, 0)
+          	_, _, c1, _ := cpuid(1, 0)
+          	lo, hi := xgetbv()
+          	fmt.Printf("FEATPROBE HasAVX2=%v HasAVX512VNNI=%v cpuid1.ecx=%#x cpuid7.ebx=%#x cpuid7.ecx=%#x xcr0=%#x:%#x\n",
+          		base.HasAVX2, base.HasAVX512VNNI, c1, b7, c7, hi, lo)
+          }
+          EOF2
+          cat > featprobe/cpuid_amd64.s <<'EOF2'
+          #include "textflag.h"
+          TEXT ·cpuid(SB), NOSPLIT, $0-24
+          	MOVL eax+0(FP), AX
+          	MOVL ecx+4(FP), CX
+          	CPUID
+          	MOVL AX, a+8(FP)
+          	MOVL BX, b+12(FP)
+          	MOVL CX, c+16(FP)
+          	MOVL DX, d+20(FP)
+          	RET
+          TEXT ·xgetbv(SB), NOSPLIT, $0-8
+          	MOVL $0, CX
+          	XGETBV
+          	MOVL AX, lo+0(FP)
+          	MOVL DX, hi+4(FP)
+          	RET
+          EOF2
+          cat > featprobe/main_arm64.go <<'EOF2'
+          package main
+
+          import (
+          	"fmt"
+
+          	"github.com/goccy/llamawasm2go/base"
+          )
+
+          func main() {
+          	fmt.Printf("FEATPROBE CPUDotProd=%v CPUI8MM=%v\n", base.CPUDotProd, base.CPUI8MM)
+          }
+          EOF2
+          go run ./featprobe || true
+          rm -rf featprobe
+
+      - name: CPU profile (go-llama)
+        timeout-minutes: 30
+        env:
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO_LLAMA_TEST_MODEL: ${{ github.workspace }}/${{ env.MODEL_PATH }}
+        run: |
+          go test -run=NONE -bench='BenchmarkDecode$' -benchtime=64x -count=1 \
+            -cpuprofile tg.prof -timeout=30m . > /dev/null
+          echo "### decode profile ###"
+          go tool pprof -top -nodecount=16 go-llama.test tg.prof 2>/dev/null | tail -n +5
+          go test -run=NONE -bench='BenchmarkPromptEval$' -benchtime=3x -count=1 \
+            -cpuprofile pp.prof -timeout=30m . > /dev/null
+          echo "### prompt profile ###"
+          go tool pprof -top -nodecount=16 go-llama.test pp.prof 2>/dev/null | tail -n +5
+
       # Same-runner A/B: the pool mixes CPU generations (Zen 3 / Zen 4 /
       # several Intels, ~30%+ apart), so only a delta measured on THIS
       # runner is meaningful. The baseline is the v0.3.0 release engine.
