@@ -1,0 +1,10 @@
+{
+  "_comment": "wikitext-2 test-split perplexity from llama-perplexity built at llama-wasm's pinned llama.cpp commit (arm64 NEON, -c 512 -b 512 --chunks 40): the reference TestWikitextPerplexityParity compares Score against. Re-record when the pinned commit moves.",
+  "model": "qwen2.5-0.5b-instruct-q8_0.gguf",
+  "corpus": "wiki.test.raw",
+  "n_ctx": 512,
+  "chunks": 40,
+  "native_ppl": 14.2517,
+  "llama_cpp": "11924d4c17abc27383376a1ac6a24fa3e36c1c0c",
+  "rel_tol": 0.005
+}
