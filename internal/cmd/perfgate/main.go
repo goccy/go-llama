@@ -5,8 +5,8 @@
 //	    [-summary $GITHUB_STEP_SUMMARY] [-engine V] [-llama-cpp SHA] [-cpu S] [-run URL]
 //
 // exits 1 when any metric's ratio to native fell more than threshold
-// below the recorded baseline; with no baseline for the arch it records
-// and passes.
+// below the recorded baseline for the same architecture and CPU model;
+// with no baseline for that pair it records and passes.
 //
 //	perfgate baseline -baseline bench/baseline.json -result result.json
 //
@@ -121,7 +121,8 @@ func compare(args []string) error {
 		return err
 	}
 	var baseArch *perfgate.ArchResult
-	if b, ok := base[*arch]; ok {
+	key := perfgate.Key(*arch, *cpu)
+	if b, ok := base[key]; ok {
 		baseArch = &b
 	}
 	verdicts := perfgate.Compare(cur, baseArch, *threshold)
@@ -138,7 +139,7 @@ func compare(args []string) error {
 	if err := os.WriteFile(*outPath, append(data, '\n'), 0o644); err != nil {
 		return err
 	}
-	summary := perfgate.Summary(*arch, verdicts, *threshold)
+	summary := perfgate.Summary(key, verdicts, *threshold)
 	fmt.Print(summary)
 	if *summaryPath != "" {
 		f, err := os.OpenFile(*summaryPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -153,10 +154,10 @@ func compare(args []string) error {
 		}
 	}
 	if baseArch == nil {
-		fmt.Printf("perfgate: no baseline for %s in %s — recorded only. Seed it with:\n  go run ./internal/cmd/perfgate baseline -baseline %s -result %s\n", *arch, *basePath, *basePath, *outPath)
+		fmt.Printf("perfgate: no baseline for %s in %s — recorded only. Seed it with:\n  go run ./internal/cmd/perfgate baseline -baseline %s -result %s\n", key, *basePath, *basePath, *outPath)
 	}
 	if len(res.Regressed) > 0 {
-		return fmt.Errorf("%s: %v regressed more than %.0f%% relative to native vs the baseline", *arch, res.Regressed, *threshold*100)
+		return fmt.Errorf("%s: %v regressed more than %.0f%% relative to native vs the baseline", key, res.Regressed, *threshold*100)
 	}
 	return nil
 }
@@ -186,7 +187,7 @@ func baseline(args []string) error {
 	if err != nil {
 		return err
 	}
-	base[res.Arch] = res.Result
+	base[perfgate.Key(res.Arch, res.Result.Recorded.CPU)] = res.Result
 	if err := perfgate.SaveBaseline(*basePath, base); err != nil {
 		return err
 	}

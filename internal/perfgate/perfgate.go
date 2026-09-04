@@ -49,8 +49,24 @@ type ArchResult struct {
 	Recorded Provenance             `json:"recorded"`
 }
 
-// Baseline maps architecture name (amd64, arm64) to its recorded result.
+// Baseline maps Key(arch, cpu) to its recorded result.
 type Baseline map[string]ArchResult
+
+// Key names a baseline entry: the architecture and the runner's CPU
+// model. The hosted runner pool mixes CPU generations whose native
+// llama.cpp and go-llama throughputs do not scale alike (a Zen 4 VM
+// that masks AVX-512 keeps native at AVX2 while decode bandwidth
+// differs from Zen 3), so a ratio recorded on one model is not a bar
+// for another. An entry is judged only against a run on the same
+// model; other models are recorded and pass. An empty cpu keys by
+// architecture alone.
+func Key(arch, cpu string) string {
+	cpu = strings.Join(strings.Fields(cpu), " ")
+	if cpu == "" {
+		return arch
+	}
+	return arch + "/" + cpu
+}
 
 // Verdict is the outcome of comparing one metric against the baseline.
 type Verdict struct {

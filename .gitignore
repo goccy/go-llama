@@ -33,3 +33,5 @@ go.work.sum
 
 # Test models: `make testdata` downloads them; they are not source.
 testdata/*.gguf
+# wikitext-2 corpus: `make testdata-wikitext` downloads it; not source.
+testdata/wiki.test.raw

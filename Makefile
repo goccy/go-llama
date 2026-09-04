@@ -18,7 +18,7 @@ ATTESTATION_API = https://api.github.com/repos/$(LLAMA_WASM_REPO)/attestations
 TEST_MODEL_URL := https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
 TEST_MODEL     := testdata/stories260K.gguf
 
-.PHONY: llama download verify testdata toolchain-check test test-arm64-native verify-native help
+.PHONY: llama download verify testdata testdata-wikitext toolchain-check test test-arm64-native verify-native help
 
 llama: download verify
 
@@ -36,6 +36,19 @@ verify:
 	  --bundle $$tmpdir/bundle.jsonl --signer-workflow $(LLAMA_WASM_WORKFLOW)
 
 testdata: $(TEST_MODEL)
+
+# wikitext-2 (test split) for TestWikitextPerplexityParity; the archive
+# is the one llama.cpp's own perplexity scripts fetch.
+WIKITEXT_URL := https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
+WIKITEXT     := testdata/wiki.test.raw
+
+testdata-wikitext: $(WIKITEXT)
+
+$(WIKITEXT):
+	mkdir -p testdata
+	curl -fSL --proto '=https' --tlsv1.2 -o testdata/wikitext-2-raw-v1.zip $(WIKITEXT_URL)
+	unzip -o -q -j testdata/wikitext-2-raw-v1.zip wikitext-2-raw/wiki.test.raw -d testdata
+	rm -f testdata/wikitext-2-raw-v1.zip
 
 $(TEST_MODEL):
 	mkdir -p testdata
