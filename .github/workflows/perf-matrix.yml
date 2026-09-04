@@ -20,6 +20,7 @@ env:
   DECODE_TOKENS: "64"
   DEPTH: "2048"
   BENCH_COUNT: "2"
+  THREAD_COUNTS: "1 2 4 8 16"
 
 jobs:
   perf:
@@ -109,6 +110,38 @@ jobs:
             native/llama-bench -m "testdata/$m.gguf" -p 0 -n "$DECODE_TOKENS" -d "$depth" -t "$NATIVE_THREADS" -r "$BENCH_COUNT" -o jsonl 2>/dev/null | tee -a out/native.jsonl
           done
 
+      - name: Threads
+        # Thread scaling on and past the runner's core count, against
+        # native at the same thread counts (the 0.5B Q8_0 model: both
+        # engines are on their fastest kernels there).
+        timeout-minutes: 40
+        run: |
+          set -eu
+          m=qwen2.5-0.5b-instruct-q8_0
+          export GO_LLAMA_TEST_MODEL="$GITHUB_WORKSPACE/testdata/$m.gguf"
+          for t in $THREAD_COUNTS; do
+            echo "=== threads $t"
+            GO_LLAMA_BENCH_THREADS=$t timeout 300 ./bench.test -test.run '^$' -test.bench 'BenchmarkDecode$' -test.benchtime "${DECODE_TOKENS}x" -test.timeout 10m | tee "out/threads-go-$t-tg.txt" || true
+            GO_LLAMA_BENCH_THREADS=$t timeout 300 ./bench.test -test.run '^$' -test.bench 'BenchmarkPromptEval$' -test.benchtime 2x -test.timeout 10m | tee "out/threads-go-$t-pp.txt" || true
+            timeout 300 native/llama-bench -m "testdata/$m.gguf" -p 512 -n "$DECODE_TOKENS" -d 0 -t "$t" -r 1 -o jsonl 2>/dev/null | tee -a out/threads-native.jsonl || true
+          done
+
+      - name: Profile
+        # CPU profiles of the regimes furthest from native, for the
+        # amd64 side that cannot be profiled on a Mac.
+        timeout-minutes: 30
+        run: |
+          set -eu
+          prof() {
+            local m=$1 bench=$2 tag=$3
+            export GO_LLAMA_TEST_MODEL="$GITHUB_WORKSPACE/testdata/$m.gguf" GO_LLAMA_BENCH_DEPTH="$DEPTH"
+            ./bench.test -test.run '^$' -test.bench "$bench" -test.benchtime 2x -test.timeout 20m -test.cpuprofile "out/prof-$m-$tag.prof" >/dev/null
+            { echo "#### profile: $m $tag"; echo '```'; go tool pprof -top -nodecount=25 bench.test "out/prof-$m-$tag.prof" 2>/dev/null | sed -n '4,40p'; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          prof qwen2.5-0.5b-instruct-q4_k_m 'BenchmarkPromptEval$' pp
+          prof Arch-Router-1.5B-Q4_K_M 'BenchmarkPromptEval$' pp
+          prof qwen2.5-0.5b-instruct-q8_0 'BenchmarkDecodeDeep$' deep
+
       - name: Table
         run: |
           python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
@@ -140,6 +173,26 @@ jobs:
           for (m, key), n in sorted(native.items()):
               g = go.get((m, key))
               print("| %s | %s | %.1f | %s | %s |" % (m, key, n, "—" if g is None else "%.1f" % g, "—" if g is None else "%.2f" % (g / n)))
+          # thread scaling (0.5B Q8_0)
+          tn = {}
+          if os.path.exists("out/threads-native.jsonl"):
+              for line in open("out/threads-native.jsonl"):
+                  r = json.loads(line)
+                  tn[(r["n_threads"], "pp512" if r["n_prompt"] else "tg64")] = r["avg_ts"]
+          tg = {}
+          for f in glob.glob("out/threads-go-*.txt"):
+              _, _, t, kind = os.path.basename(f)[:-4].split("-")
+              for line in open(f):
+                  mm = pat.match(line.strip())
+                  if mm:
+                      tg[(int(t), {"tg": "tg64", "pp": "pp512"}[kind])] = float(mm.group(2))
+          print("\n### thread scaling, qwen2.5-0.5b-instruct-q8_0 (%d cores)\n" % os.cpu_count())
+          print("| threads | metric | native tok/s | go-llama tok/s | go/native |")
+          print("|---|---|--:|--:|--:|")
+          for t in sorted({k[0] for k in tn} | {k[0] for k in tg}):
+              for key in ("pp512", "tg64"):
+                  n, g = tn.get((t, key)), tg.get((t, key))
+                  print("| %d | %s | %s | %s | %s |" % (t, key, "timeout" if n is None else "%.1f" % n, "timeout" if g is None else "%.1f" % g, "—" if n is None or g is None else "%.2f" % (g / n)))
           EOF
         env:
           ARCH: ${{ matrix.name }}

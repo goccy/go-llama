@@ -25,12 +25,27 @@ func benchContext(b *testing.B, nCtx uint32) (*llama.Model, *llama.Context) {
 		b.Fatalf("LoadModel: %v", err)
 	}
 	b.Cleanup(func() { m.Close() })
-	ctx, err := m.NewContext(llama.ContextParams{NCtx: nCtx})
+	ctx, err := m.NewContext(llama.ContextParams{NCtx: nCtx, NThreads: benchThreads(b)})
 	if err != nil {
 		b.Fatalf("NewContext: %v", err)
 	}
 	b.Cleanup(func() { ctx.Close() })
 	return m, ctx
+}
+
+// benchThreads is GO_LLAMA_BENCH_THREADS (default 1): the ggml thread
+// count, effective only in a threads-enabled engine build.
+func benchThreads(b *testing.B) uint32 {
+	b.Helper()
+	s := os.Getenv("GO_LLAMA_BENCH_THREADS")
+	if s == "" {
+		return 1
+	}
+	var n uint32
+	if _, err := fmt.Sscan(s, &n); err != nil {
+		b.Fatalf("GO_LLAMA_BENCH_THREADS: %v", err)
+	}
+	return n
 }
 
 func benchModelName(b *testing.B) string {
