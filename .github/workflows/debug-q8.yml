@@ -1,0 +1,38 @@
+name: debug-q8
+on:
+  push:
+    branches: [debug/q8-classifier-repro]
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: CPU flags
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          grep -m1 -o "avx2" /proc/cpuinfo || echo "NO avx2"
+          grep -m1 -o "avx512_vnni" /proc/cpuinfo || echo "NO avx512_vnni"
+      - name: Fetch q8_0 model
+        run: |
+          curl -fsSL --retry 3 -o /tmp/classifier.gguf \
+            "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q8_0.gguf"
+          ls -lh /tmp/classifier.gguf
+      - name: Golden (GOAMD64=v1, pure-Go lowering)
+        env:
+          GOAMD64: v1
+          Q8_MODEL: /tmp/classifier.gguf
+          SCORES_OUT: /tmp/golden.json
+        run: go test -run 'TestQ8ClassifierShape' -count=1 -v -timeout 30m 2>&1 | grep -vE "^=== RUN"
+      - name: Suspect (GOAMD64=v2, splices + overrides) vs golden
+        env:
+          GOAMD64: v2
+          Q8_MODEL: /tmp/classifier.gguf
+          SCORES_GOLDEN: /tmp/golden.json
+        run: go test -run 'TestQ8ClassifierShape' -count=1 -v -timeout 30m 2>&1 | grep -vE "^=== RUN"
