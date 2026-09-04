@@ -64,8 +64,19 @@ func BenchmarkDecode(b *testing.B) {
 func BenchmarkPromptEval(b *testing.B) {
 	m, ctx := benchContext(b, 2048)
 	prompt := strings.Repeat("Once upon a time there was a little girl who loved to play outside. ", 60)
-	if _, err := m.Tokenize(prompt, true, false); err != nil {
-		b.Fatalf("Tokenize: %v", err)
+	// ggml's mul_mat takes its two-row vec_dot path only for an even
+	// batch (ne11 % 2 == 0), and llama-bench's pp sizes are even, so
+	// pad the prompt until its token count is even (and the 512-token
+	// batches it splits into are all even).
+	for i := 0; i < 8; i++ {
+		toks, err := m.Tokenize(prompt, true, false)
+		if err != nil {
+			b.Fatalf("Tokenize: %v", err)
+		}
+		if len(toks)%2 == 0 {
+			break
+		}
+		prompt += " and"
 	}
 	b.ResetTimer()
 	nPrompt := 0
