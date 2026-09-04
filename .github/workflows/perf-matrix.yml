@@ -1,0 +1,152 @@
+name: Perf matrix
+
+# go-llama against native llama.cpp on the hosted runners, per model and
+# per regime: prompt processing (pp512), shallow decode (tg64) and decode
+# at a 2048-token KV depth (tg64 @ d2048), for the Q8_0 and Q4_K_M
+# models. Prints one go/native table per architecture into the job
+# summary and uploads the raw numbers. Same native build and thread
+# setting as perf.yml; this workflow judges nothing, it measures.
+on:
+  push:
+    branches: [perf/kquant-matrix]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_CPP_COMMIT: 11924d4c17abc27383376a1ac6a24fa3e36c1c0c
+  NATIVE_THREADS: "1"
+  DECODE_TOKENS: "64"
+  DEPTH: "2048"
+  BENCH_COUNT: "2"
+
+jobs:
+  perf:
+    name: Perf matrix (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            runner: ubuntu-latest
+            goamd64: v2
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            goamd64: ""
+    env:
+      GOAMD64: ${{ matrix.goamd64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Runner CPU
+        id: cpu
+        run: |
+          model=$(lscpu | awk -F: '/Model name/ {gsub(/^ +/, "", $2); print $2; exit}')
+          echo "model=${model:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "cpu: ${model:-unknown} ($(nproc) cores)"
+          lscpu | grep -iE "^Flags" | grep -oE "avx2|avx512_vnni|asimddp|i8mm|sve2" | sort -u | tr '\n' ' '; echo
+
+      - name: Cache models
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: testdata/*.gguf
+          key: perf-matrix-models-v1
+      - name: Fetch models
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p testdata
+          curl -fSL --proto '=https' --tlsv1.2 -o testdata/qwen2.5-0.5b-instruct-q8_0.gguf   https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
+          curl -fSL --proto '=https' --tlsv1.2 -o testdata/qwen2.5-0.5b-instruct-q4_k_m.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+          curl -fSL --proto '=https' --tlsv1.2 -o testdata/Arch-Router-1.5B-Q4_K_M.gguf       https://huggingface.co/katanemo/Arch-Router-1.5B.gguf/resolve/main/Arch-Router-1.5B-Q4_K_M.gguf
+
+      - name: Cache native llama-bench
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: native/llama-bench
+          key: llama-bench-static-${{ env.LLAMA_CPP_COMMIT }}-${{ matrix.name }}-${{ runner.os }}
+      - name: Build native llama.cpp at the engine's commit
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 30
+        run: |
+          mkdir -p /tmp/llama.cpp native && cd /tmp/llama.cpp
+          git init -q && git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch -q --depth 1 origin "$LLAMA_CPP_COMMIT" && git checkout -q FETCH_HEAD
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_CURL=OFF \
+            -DBUILD_SHARED_LIBS=OFF >/dev/null
+          cmake --build build --target llama-bench -j "$(nproc)" 2>&1 | tail -2
+          cp build/bin/llama-bench "$GITHUB_WORKSPACE/native/llama-bench"
+      - name: Native binary sanity
+        run: native/llama-bench --help >/dev/null
+
+      - name: Build the benchmark binary
+        run: |
+          echo "engine: $(go list -m github.com/goccy/llamawasm2go)"
+          go test -c -o bench.test .
+
+      - name: Measure
+        timeout-minutes: 100
+        run: |
+          set -eu
+          mkdir -p out
+          for m in qwen2.5-0.5b-instruct-q8_0 qwen2.5-0.5b-instruct-q4_k_m Arch-Router-1.5B-Q4_K_M; do
+            echo "=== $m"
+            export GO_LLAMA_TEST_MODEL="$GITHUB_WORKSPACE/testdata/$m.gguf" GO_LLAMA_BENCH_DEPTH="$DEPTH"
+            ./bench.test -test.run '^$' -test.bench 'BenchmarkDecode$' -test.benchtime "${DECODE_TOKENS}x" -test.count "$BENCH_COUNT" -test.timeout 40m | tee "out/go-$m-tg.txt"
+            ./bench.test -test.run '^$' -test.bench 'BenchmarkPromptEval$' -test.benchtime 2x -test.count "$BENCH_COUNT" -test.timeout 40m | tee "out/go-$m-pp.txt"
+            ./bench.test -test.run '^$' -test.bench 'BenchmarkDecodeDeep$' -test.benchtime "${DECODE_TOKENS}x" -test.count "$BENCH_COUNT" -test.timeout 40m | tee "out/go-$m-deep.txt"
+            # native at the depth the Go benchmark actually reached (the
+            # tokenizer round trip trims the prompt a little).
+            depth=$(grep -oE '[0-9]+ depth' "out/go-$m-deep.txt" | head -1 | cut -d' ' -f1)
+            native/llama-bench -m "testdata/$m.gguf" -p 512 -n "$DECODE_TOKENS" -d 0 -t "$NATIVE_THREADS" -r "$BENCH_COUNT" -o jsonl 2>/dev/null | tee -a out/native.jsonl
+            native/llama-bench -m "testdata/$m.gguf" -p 0 -n "$DECODE_TOKENS" -d "$depth" -t "$NATIVE_THREADS" -r "$BENCH_COUNT" -o jsonl 2>/dev/null | tee -a out/native.jsonl
+          done
+
+      - name: Table
+        run: |
+          python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, re, os, glob
+          native = {}
+          for line in open("out/native.jsonl"):
+              r = json.loads(line)
+              m = os.path.basename(r["model_filename"]).replace(".gguf", "")
+              key = "pp512" if r["n_prompt"] else ("tg64" if r["n_depth"] == 0 else "tg64 @d%d" % r["n_depth"])
+              native[(m, key)] = r["avg_ts"]
+          go = {}
+          pat = re.compile(r"^Benchmark(\w+?)-\d+\s.*?([\d.]+) (?:prompt_)?tok/s\s*$")
+          for f in glob.glob("out/go-*.txt"):
+              m = os.path.basename(f)[3:].rsplit("-", 1)[0]
+              for line in open(f):
+                  mm = pat.match(line.strip())
+                  if not mm:
+                      continue
+                  name, val = mm.group(1), float(mm.group(2))
+                  if name == "DecodeDeep":
+                      d = re.search(r"([\d.]+) depth", line)
+                      key = "tg64 @d%d" % int(float(d.group(1)))
+                  else:
+                      key = {"Decode": "tg64", "PromptEval": "pp512"}[name]
+                  go[(m, key)] = max(go.get((m, key), 0.0), val)
+          print("### %s (%s), 1 thread\n" % (os.environ.get("ARCH", ""), os.environ.get("CPU", "")))
+          print("| model | metric | native tok/s | go-llama tok/s | go/native |")
+          print("|---|---|--:|--:|--:|")
+          for (m, key), n in sorted(native.items()):
+              g = go.get((m, key))
+              print("| %s | %s | %.1f | %s | %s |" % (m, key, n, "—" if g is None else "%.1f" % g, "—" if g is None else "%.2f" % (g / n)))
+          EOF
+        env:
+          ARCH: ${{ matrix.name }}
+          CPU: ${{ steps.cpu.outputs.model }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-matrix-${{ matrix.name }}
+          path: out/

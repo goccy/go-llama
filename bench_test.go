@@ -7,6 +7,7 @@ package llama_test
 // caller feels.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,4 +82,53 @@ func BenchmarkPromptEval(b *testing.B) {
 		nPrompt = res.NPrompt
 	}
 	b.ReportMetric(float64(nPrompt)*float64(b.N)/b.Elapsed().Seconds(), "prompt_tok/s")
+}
+
+// BenchmarkDecodeDeep reports token-generation throughput with the KV
+// cache already holding GO_LLAMA_BENCH_DEPTH tokens (default 2048), the
+// regime native llama-bench's `tg64 @ d2048` measures: the prompt is
+// decoded once outside the timed region and every iteration reuses it
+// through CachePrompt, so only the decode loop is timed (the engine's
+// own decode timing, as llama-bench reports it).
+func BenchmarkDecodeDeep(b *testing.B) {
+	depth := 2048
+	if s := os.Getenv("GO_LLAMA_BENCH_DEPTH"); s != "" {
+		if _, err := fmt.Sscan(s, &depth); err != nil {
+			b.Fatalf("GO_LLAMA_BENCH_DEPTH: %v", err)
+		}
+	}
+	m, ctx := benchContext(b, uint32(depth+b.N+64))
+	unit := "Once upon a time there was a little girl who loved to play outside. "
+	toks, err := m.Tokenize(unit, false, false)
+	if err != nil {
+		b.Fatalf("Tokenize: %v", err)
+	}
+	prompt := strings.Repeat(unit, (depth+len(toks)-1)/len(toks))
+	all, err := m.Tokenize(prompt, false, false)
+	if err != nil {
+		b.Fatalf("Tokenize: %v", err)
+	}
+	if len(all) > depth {
+		all = all[:depth]
+	}
+	if prompt, err = m.Detokenize(all, false); err != nil {
+		b.Fatalf("Detokenize: %v", err)
+	}
+	if _, err := ctx.Generate(prompt, llama.Params{NPredict: 1, Temperature: 0}); err != nil {
+		b.Fatalf("Generate (fill): %v", err)
+	}
+	b.ResetTimer()
+	res, err := ctx.Generate(prompt, llama.Params{NPredict: b.N, Temperature: 0, CachePrompt: true, IgnoreEOS: true})
+	b.StopTimer()
+	if err != nil {
+		b.Fatalf("Generate: %v", err)
+	}
+	if res.NDecoded != b.N {
+		b.Fatalf("wanted %d tokens, decoded %d (%s)", b.N, res.NDecoded, res.Reason)
+	}
+	if res.NCached < res.NPrompt-8 {
+		b.Fatalf("CachePrompt reused %d of %d prompt tokens", res.NCached, res.NPrompt)
+	}
+	b.ReportMetric(float64(res.NPrompt), "depth")
+	b.ReportMetric(float64(b.N)/(res.Timings.DecodeMS/1000), "tok/s")
 }
