@@ -1,44 +1,44 @@
 {
-  "amd64": {
+  "amd64/AMD EPYC 7763 64-Core Processor": {
     "metrics": {
       "pp": {
-        "go_tok_s": 34.35,
-        "native_tok_s": 90.4483,
-        "ratio": 0.3797749653669555
+        "go_tok_s": 98.11,
+        "native_tok_s": 89.7995,
+        "ratio": 1.0925450587141354
       },
       "tg": {
-        "go_tok_s": 21.08,
-        "native_tok_s": 29.3524,
-        "ratio": 0.7181695534266362
+        "go_tok_s": 32.87,
+        "native_tok_s": 30.2362,
+        "ratio": 1.0871075068957077
       }
     },
     "recorded": {
-      "engine": "github.com/goccy/llamawasm2go v0.3.2",
+      "engine": "github.com/goccy/llamawasm2go v0.3.3",
       "llama_cpp": "11924d4c17abc27383376a1ac6a24fa3e36c1c0c",
       "cpu": "AMD EPYC 7763 64-Core Processor",
-      "run": "https://github.com/goccy/go-llama/actions/runs/33713255973",
-      "date": "2026-09-03"
+      "run": "https://github.com/goccy/go-llama/actions/runs/33820511129",
+      "date": "2026-09-04"
     }
   },
-  "arm64": {
+  "arm64/Neoverse-N2": {
     "metrics": {
       "pp": {
-        "go_tok_s": 54.41,
-        "native_tok_s": 85.676,
-        "ratio": 0.635066996591811
+        "go_tok_s": 119.5,
+        "native_tok_s": 85.7019,
+        "ratio": 1.3943681528647558
       },
       "tg": {
-        "go_tok_s": 26.65,
-        "native_tok_s": 37.067,
-        "ratio": 0.7189683546011276
+        "go_tok_s": 34.78,
+        "native_tok_s": 35.4621,
+        "ratio": 0.9807653805048206
       }
     },
     "recorded": {
-      "engine": "github.com/goccy/llamawasm2go v0.3.2",
+      "engine": "github.com/goccy/llamawasm2go v0.3.3",
       "llama_cpp": "11924d4c17abc27383376a1ac6a24fa3e36c1c0c",
       "cpu": "Neoverse-N2",
-      "run": "https://github.com/goccy/go-llama/actions/runs/33713255973",
-      "date": "2026-09-03"
+      "run": "https://github.com/goccy/go-llama/actions/runs/33820511129",
+      "date": "2026-09-04"
     }
   }
 }

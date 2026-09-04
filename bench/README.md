@@ -26,9 +26,14 @@ go run ./internal/cmd/perfgate baseline -baseline bench/baseline.json -result /t
 go run ./internal/cmd/perfgate baseline -baseline bench/baseline.json -result /tmp/perf-amd64/result.json
 ```
 
-An architecture with no baseline entry is recorded but not judged (the
-job passes and prints the command above), which is how a new
-architecture — or an empty file — gets seeded.
+Entries are keyed by architecture **and runner CPU model**
+(`amd64/AMD EPYC 7763 64-Core Processor`, `arm64/Neoverse-N2`): the
+hosted pool mixes CPU generations whose native and go-llama throughputs
+do not scale alike, so a ratio recorded on one model is not a bar for
+another. A run on a model with no entry is recorded but not judged (the
+job passes and prints the command above), which is how a new model —
+or an empty file — gets seeded; add an entry for a model once it shows
+up often enough to be worth gating.
 
 When the engine's llama.cpp moves (a `llamawasm2go` bump), update
 `LLAMA_CPP_COMMIT` in the workflow to llama-wasm's submodule commit for

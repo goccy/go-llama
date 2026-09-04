@@ -147,3 +147,12 @@ func TestSummaryMarksRegression(t *testing.T) {
 		}
 	}
 }
+
+func TestKeyPairsArchWithCPUModel(t *testing.T) {
+	if got := Key("amd64", "  AMD EPYC 7763   64-Core Processor "); got != "amd64/AMD EPYC 7763 64-Core Processor" {
+		t.Fatalf("Key = %q", got)
+	}
+	if got := Key("arm64", ""); got != "arm64" {
+		t.Fatalf("Key with no cpu = %q", got)
+	}
+}
