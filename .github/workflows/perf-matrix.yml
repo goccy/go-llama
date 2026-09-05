@@ -135,12 +135,16 @@ jobs:
           prof() {
             local m=$1 bench=$2 tag=$3
             export GO_LLAMA_TEST_MODEL="$GITHUB_WORKSPACE/testdata/$m.gguf" GO_LLAMA_BENCH_DEPTH="$DEPTH"
-            ./bench.test -test.run '^$' -test.bench "$bench" -test.benchtime 2x -test.timeout 20m -test.cpuprofile "out/prof-$m-$tag.prof" >/dev/null
-            { echo "#### profile: $m $tag"; echo '```'; go tool pprof -top -nodecount=25 bench.test "out/prof-$m-$tag.prof" 2>/dev/null | sed -n '4,40p'; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+            local bt=2x; case "$bench" in *Decode\$) bt="${DECODE_TOKENS}x";; esac
+            ./bench.test -test.run '^$' -test.bench "$bench" -test.benchtime "$bt" -test.timeout 20m -test.cpuprofile "out/prof-$m-$tag.prof" >/dev/null
+            { echo "#### profile: $m $tag"; echo '```'; go tool pprof -top -nodecount=30 bench.test "out/prof-$m-$tag.prof" 2>/dev/null | sed -n '4,45p'; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
           }
           prof qwen2.5-0.5b-instruct-q4_k_m 'BenchmarkPromptEval$' pp
           prof Arch-Router-1.5B-Q4_K_M 'BenchmarkPromptEval$' pp
           prof qwen2.5-0.5b-instruct-q8_0 'BenchmarkDecodeDeep$' deep
+          # decode at the runner's core count: where the multi-thread
+          # loss goes (barrier spin, scheduler, runtime threads)
+          GO_LLAMA_BENCH_THREADS=$(nproc) prof qwen2.5-0.5b-instruct-q8_0 'BenchmarkDecode$' "tg-t$(nproc)"
 
       - name: Table
         run: |
