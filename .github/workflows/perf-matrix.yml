@@ -58,7 +58,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: testdata/*.gguf
-          key: perf-matrix-models-v1
+          key: perf-matrix-models-v2
       - name: Fetch models
         if: steps.model-cache.outputs.cache-hit != 'true'
         run: |
@@ -66,6 +66,7 @@ jobs:
           curl -fSL --proto '=https' --tlsv1.2 -o testdata/qwen2.5-0.5b-instruct-q8_0.gguf   https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
           curl -fSL --proto '=https' --tlsv1.2 -o testdata/qwen2.5-0.5b-instruct-q4_k_m.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
           curl -fSL --proto '=https' --tlsv1.2 -o testdata/Arch-Router-1.5B-Q4_K_M.gguf       https://huggingface.co/katanemo/Arch-Router-1.5B.gguf/resolve/main/Arch-Router-1.5B-Q4_K_M.gguf
+          curl -fSL --proto '=https' --tlsv1.2 -o testdata/stories260K.gguf                https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
 
       - name: Cache native llama-bench
         id: native-cache
@@ -125,6 +126,16 @@ jobs:
             GO_LLAMA_BENCH_THREADS=$t timeout 300 ./bench.test -test.run '^$' -test.bench 'BenchmarkPromptEval$' -test.benchtime 2x -test.timeout 10m | tee "out/threads-go-$t-pp.txt" || true
             timeout 300 native/llama-bench -m "testdata/$m.gguf" -p 512 -n "$DECODE_TOKENS" -d 0 -t "$t" -r 1 -o jsonl 2>/dev/null | tee -a out/threads-native.jsonl || true
           done
+          # Per-op synchronization cost in isolation: stories260K (0.26M
+          # params, F32) has almost no arithmetic, so its decode rate is the
+          # per-token fixed cost plus one barrier per graph node.
+          export GO_LLAMA_TEST_MODEL="$GITHUB_WORKSPACE/testdata/stories260K.gguf"
+          for t in 1 2 4; do
+            echo "=== stories260K threads $t"
+            GO_LLAMA_BENCH_THREADS=$t timeout 300 ./bench.test -test.run '^$' -test.bench 'BenchmarkDecode$' -test.benchtime 2000x -test.timeout 10m | tee "out/threads-stories-go-$t-tg.txt" || true
+            timeout 300 native/llama-bench -m testdata/stories260K.gguf -p 0 -n 2000 -t "$t" -r 1 -o jsonl 2>/dev/null | tee -a out/threads-stories-native.jsonl || true
+          done
+          export GO_LLAMA_TEST_MODEL="$GITHUB_WORKSPACE/testdata/$m.gguf"
           # At the core count every processor runs a ggml worker, so a GC
           # mark worker or a stop-the-world stalls a barrier; decode once
           # more with the collector off to size that share.
