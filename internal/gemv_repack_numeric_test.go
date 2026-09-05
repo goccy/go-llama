@@ -26,7 +26,7 @@ import (
 // recorded in the llama-wasm release build log); it moves with any
 // engine rebuild, so re-read it from the log (or the bundle's
 // load32_splat memarg offsets) when bumping the bundle dependency.
-const repackF16Table = 8793760
+const repackF16Table = 8794144
 
 func f16Bits(f float32) uint16 {
 	// Exact for the small power-of-two scales the tests use.
