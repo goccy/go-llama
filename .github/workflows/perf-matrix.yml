@@ -125,6 +125,12 @@ jobs:
             GO_LLAMA_BENCH_THREADS=$t timeout 300 ./bench.test -test.run '^$' -test.bench 'BenchmarkPromptEval$' -test.benchtime 2x -test.timeout 10m | tee "out/threads-go-$t-pp.txt" || true
             timeout 300 native/llama-bench -m "testdata/$m.gguf" -p 512 -n "$DECODE_TOKENS" -d 0 -t "$t" -r 1 -o jsonl 2>/dev/null | tee -a out/threads-native.jsonl || true
           done
+          # At the core count every processor runs a ggml worker, so a GC
+          # mark worker or a stop-the-world stalls a barrier; decode once
+          # more with the collector off to size that share.
+          t=$(nproc)
+          echo "=== threads $t, GOGC=off"
+          GOGC=off GO_LLAMA_BENCH_THREADS=$t timeout 300 ./bench.test -test.run '^$' -test.bench 'BenchmarkDecode$' -test.benchtime "${DECODE_TOKENS}x" -test.timeout 10m | tee "out/threads-go-gcoff-$t-tg.txt" || true
 
       - name: Profile
         # CPU profiles of the regimes furthest from native, for the
