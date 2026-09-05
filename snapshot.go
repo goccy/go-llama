@@ -162,7 +162,9 @@ func (f *Instance) Context(name string) *Context { return f.ctxs[name] }
 func (f *Instance) Close() error { return f.l.Close() }
 
 // attachThreadpool rebuilds and attaches a context's ggml threadpool via the
-// bridge; n <= 1 detaches instead.
+// bridge; n <= 1 detaches instead. The bridge reports the thread counts the
+// context will compute with afterwards; they must equal the pool size, since
+// a pool the context does not use leaves its workers idling.
 func attachThreadpool(m *bridge.Module, ctxH uint64, n uint32) error {
 	js, err := m.LlamaCtxAttachThreadpool(ctxH, n)
 	if err != nil {
@@ -170,6 +172,15 @@ func attachThreadpool(m *bridge.Module, ctxH uint64, n uint32) error {
 	}
 	var out struct {
 		envelope
+		NThreads      uint32 `json:"n_threads"`
+		NThreadsBatch uint32 `json:"n_threads_batch"`
 	}
-	return decode("attach threadpool", js, &out)
+	if err := decode("attach threadpool", js, &out); err != nil {
+		return err
+	}
+	want := max(n, 1)
+	if out.NThreads != want || out.NThreadsBatch != want {
+		return fmt.Errorf("attach threadpool: context computes with %d/%d threads, want %d", out.NThreads, out.NThreadsBatch, want)
+	}
+	return nil
 }

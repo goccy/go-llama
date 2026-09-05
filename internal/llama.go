@@ -992,7 +992,11 @@ func LlamaChatApplyTemplate(model uint64, messagesJson string, messagesJsonLen u
 //	shared snapshot pages and its dead threads cannot be joined. n_threads
 //
 // <
-// = 1 detaches instead. Returns {"ok":true} or an error object.
+// = 1 detaches instead, and the context's n_threads / n_threads_batch
+//
+//	are set to the pool size (1 when detached) so graphs actually use the
+//	workers. Returns {"ok":true,"n_threads":N,"n_threads_batch":N} — the
+//	counts the context now computes with — or an error object.
 func LlamaCtxAttachThreadpool(ctx uint64, nThreads uint32) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, ctx)
@@ -1362,6 +1366,23 @@ func LlamaModelLoadProgressAddr() (uint64, error) {
 	return readScalarAtField(resp, 1, (*pbReader).readUint64), nil
 }
 
+// JSON list of the model's weight tensors:
+//
+//	{"ok":true,"tensors":[{"name":"blk.0.attn_q.weight","type":"q4_K",
+//	"ne":[1536,1536],"buffer":"CPU_REPACK","vec_dot_type":"q8_K"},...]}
+//	buffer is the ggml backend buffer holding the tensor ("CPU_REPACK" when
+//	the CPU backend repacked it for its GEMV/GEMM kernels, "CPU" otherwise),
+//	vec_dot_type the activation type its dot product quantizes to.
+func LlamaModelTensors(model uint64) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, model)
+	resp, err := invokeMethod(0, 23, buf, wasm2go.Inv_0_23)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
 // The text piece a single token renders to, as JSON `{"ok":true,"text":".."}`.
 // Byte-level tokens can render to invalid UTF-8 on their own; the caller is
 // expected to accumulate pieces.
@@ -1370,7 +1391,7 @@ func LlamaTokenToPiece(model uint64, token int32, renderSpecial int32) (string, 
 	buf = pbAppendUint64(buf, 1, model)
 	buf = pbAppendInt32(buf, 2, token)
 	buf = pbAppendInt32(buf, 3, renderSpecial)
-	resp, err := invokeMethod(0, 23, buf, wasm2go.Inv_0_23)
+	resp, err := invokeMethod(0, 24, buf, wasm2go.Inv_0_24)
 	if err != nil {
 		return "", err
 	}
@@ -1387,7 +1408,7 @@ func LlamaTokenize(model uint64, text string, textLen uint32, addSpecial int32, 
 	buf = pbAppendUint64(buf, 3, uint64(textLen))
 	buf = pbAppendInt32(buf, 4, addSpecial)
 	buf = pbAppendInt32(buf, 5, parseSpecial)
-	resp, err := invokeMethod(0, 24, buf, wasm2go.Inv_0_24)
+	resp, err := invokeMethod(0, 25, buf, wasm2go.Inv_0_25)
 	if err != nil {
 		return "", err
 	}
@@ -1398,7 +1419,7 @@ func LlamaTokenize(model uint64, text string, textLen uint32, addSpecial int32, 
 // and whether this wasm was built with SIMD / threads. Diagnostics only.
 func LlamaWasmBuildInfo() (string, error) {
 	buf := pbNewBuf()
-	resp, err := invokeMethod(0, 25, buf, wasm2go.Inv_0_25)
+	resp, err := invokeMethod(0, 26, buf, wasm2go.Inv_0_26)
 	if err != nil {
 		return "", err
 	}
@@ -1408,7 +1429,7 @@ func LlamaWasmBuildInfo() (string, error) {
 // Free process-wide backend state. After this every handle is invalid.
 func LlamaWasmFree() error {
 	buf := pbNewBuf()
-	_, err := invokeMethod(0, 26, buf, wasm2go.Inv_0_26)
+	_, err := invokeMethod(0, 27, buf, wasm2go.Inv_0_27)
 	return err
 }
 
@@ -1416,7 +1437,7 @@ func LlamaWasmFree() error {
 // llama_model_load, so an embedder normally never calls it.
 func LlamaWasmInit() error {
 	buf := pbNewBuf()
-	_, err := invokeMethod(0, 27, buf, wasm2go.Inv_0_27)
+	_, err := invokeMethod(0, 28, buf, wasm2go.Inv_0_28)
 	return err
 }
 
@@ -1425,7 +1446,7 @@ func LlamaWasmInit() error {
 // this exists for the handle-returning calls, which can only signal 0.
 func LlamaWasmLastError() (string, error) {
 	buf := pbNewBuf()
-	resp, err := invokeMethod(0, 28, buf, wasm2go.Inv_0_28)
+	resp, err := invokeMethod(0, 29, buf, wasm2go.Inv_0_29)
 	if err != nil {
 		return "", err
 	}

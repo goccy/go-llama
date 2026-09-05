@@ -54,6 +54,7 @@ const (
 	midModelInfo
 	midModelLoad
 	midModelLoadProgressAddr
+	midModelTensors
 	midTokenToPiece
 	midTokenize
 	midWasmBuildInfo
@@ -90,12 +91,13 @@ var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 	midModelInfo:              wasm2go.Inv_0_20,
 	midModelLoad:              wasm2go.Inv_0_21,
 	midModelLoadProgressAddr:  wasm2go.Inv_0_22,
-	midTokenToPiece:           wasm2go.Inv_0_23,
-	midTokenize:               wasm2go.Inv_0_24,
-	midWasmBuildInfo:          wasm2go.Inv_0_25,
-	midWasmFree:               wasm2go.Inv_0_26,
-	midWasmInit:               wasm2go.Inv_0_27,
-	midWasmLastError:          wasm2go.Inv_0_28,
+	midModelTensors:           wasm2go.Inv_0_23,
+	midTokenToPiece:           wasm2go.Inv_0_24,
+	midTokenize:               wasm2go.Inv_0_25,
+	midWasmBuildInfo:          wasm2go.Inv_0_26,
+	midWasmFree:               wasm2go.Inv_0_27,
+	midWasmInit:               wasm2go.Inv_0_28,
+	midWasmLastError:          wasm2go.Inv_0_29,
 }
 
 // NewEngine brings up an independent engine instance: its own wasm module
@@ -530,6 +532,16 @@ func (m *Module) LlamaModelInfo(model uint64) (string, error) {
 	buf := pbNewBuf()
 	buf = pbAppendUint64(buf, 1, model)
 	resp, err := m.invokeMethod(midModelInfo, buf)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+func (m *Module) LlamaModelTensors(model uint64) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, model)
+	resp, err := m.invokeMethod(midModelTensors, buf)
 	if err != nil {
 		return "", err
 	}
