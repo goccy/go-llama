@@ -417,25 +417,7 @@ func (m *Model) TokenToPiece(token int32, renderSpecial bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var out struct {
-		envelope
-		Text string `json:"text"`
-		B64  string `json:"b64"`
-	}
-	if err := decode("token_to_piece", js, &out); err != nil {
-		return "", err
-	}
-	// A byte-fallback token holds a partial UTF-8 sequence, which the JSON
-	// text field cannot carry losslessly; the base64 field carries the raw
-	// bytes exactly as llama.cpp's llama_token_to_piece returns them.
-	if out.B64 != "" {
-		raw, err := base64.StdEncoding.DecodeString(out.B64)
-		if err != nil {
-			return "", fmt.Errorf("token_to_piece: bad b64 payload: %w", err)
-		}
-		return string(raw), nil
-	}
-	return out.Text, nil
+	return decodeText("token_to_piece", js)
 }
 
 // ApplyChatTemplate renders messages into a prompt with the model's chat
@@ -624,10 +606,18 @@ func (c *Context) GenerateWithDraft(draft *Context, prompt string, p Params, nDr
 	var out struct {
 		envelope
 		Result
+		B64 string `json:"b64"`
 	}
 	if err := decode("generate", js, &out); err != nil {
 		return Result{}, err
 	}
+	// Result.Text must be the bytes the token sink saw, not a U+FFFD-patched
+	// rendering of them; see decodeText.
+	text, err := textFields{Text: out.Text, B64: out.B64}.bytes("generate")
+	if err != nil {
+		return Result{}, err
+	}
+	out.Result.Text = text
 	return out.Result, nil
 }
 
@@ -855,10 +845,18 @@ func (c *Context) generate(prompt string, req genRequest, sink bridge.Token_Sink
 	var out struct {
 		envelope
 		Result
+		B64 string `json:"b64"`
 	}
 	if err := decode("generate", js, &out); err != nil {
 		return Result{}, err
 	}
+	// Result.Text must be the bytes the token sink saw, not a U+FFFD-patched
+	// rendering of them; see decodeText.
+	text, err := textFields{Text: out.Text, B64: out.B64}.bytes("generate")
+	if err != nil {
+		return Result{}, err
+	}
+	out.Result.Text = text
 	return out.Result, nil
 }
 
@@ -884,14 +882,41 @@ func decode(what, js string, v enveloped) error {
 	return v.err(what)
 }
 
-// decodeText is the common shape of the calls that return just a string.
+// decodeText is the common shape of the calls that return model-produced
+// bytes: a "text" field plus a "b64" copy of the same bytes.
+//
+// Tokenizers are byte-level, so a piece can be a partial UTF-8 sequence (see
+// utf8.go). The JSON text field cannot carry that losslessly — encoding/json
+// replaces invalid UTF-8 with U+FFFD — while the token-sink callback hands
+// Stream the raw bytes; b64 carries them exactly, so Result.Text and the
+// streamed pieces agree byte for byte. text alone is accepted for bridges
+// that predate the b64 field.
 func decodeText(what, js string) (string, error) {
 	var out struct {
 		envelope
-		Text string `json:"text"`
+		textFields
 	}
 	if err := decode(what, js, &out); err != nil {
 		return "", err
 	}
-	return out.Text, nil
+	return out.textFields.bytes(what)
+}
+
+// textFields is the text-plus-b64 pair every bridge result that carries
+// model-produced bytes uses.
+type textFields struct {
+	Text string `json:"text"`
+	B64  string `json:"b64"`
+}
+
+// bytes returns the raw bytes: the b64 field when present, else the text.
+func (t textFields) bytes(what string) (string, error) {
+	if t.B64 == "" {
+		return t.Text, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(t.B64)
+	if err != nil {
+		return "", fmt.Errorf("llama: %s: bad b64 payload: %w", what, err)
+	}
+	return string(raw), nil
 }
