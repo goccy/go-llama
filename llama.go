@@ -203,13 +203,23 @@ type ContextParams struct {
 	// threads-enabled build (BuildInfo.Threads); the single-threaded wasm
 	// clamps to 1.
 	NThreads uint32
-	// NSeqMax is the number of sequences the context can hold at once. A
-	// value > 1 turns on the unified KV cache: NCtx stays the TOTAL cell
-	// budget shared by every sequence, and ScoreChoices batches its
-	// teacher-forced candidates into one decode (one sequence per candidate,
-	// all sharing the stem). Zero or 1 keeps the single-sequence default,
-	// where ScoreChoices decodes candidates one at a time.
+	// NSeqMax is the number of sequences the context can hold at once: the
+	// slots of a Slots, or the candidates ScoreChoices decodes in one batch
+	// (one sequence per candidate, all sharing the stem). Zero or 1 is the
+	// single-sequence default, where ScoreChoices decodes candidates one at
+	// a time.
 	NSeqMax uint32
+	// KVUnified chooses how the NSeqMax sequences share the KV cache, as
+	// llama.cpp's kv_unified does. False, the default, gives each sequence
+	// its own stream of NCtx / NSeqMax cells: attention over a sequence then
+	// costs only its own cells, which is what independent tasks on a Slots
+	// want. True shares one buffer of NCtx cells across the sequences, where
+	// copying a sequence is metadata rather than a copy: what ScoreChoices'
+	// batched path leans on (its candidates all share the stem), and what a
+	// prompt prefix shared across slots needs. The measured difference for
+	// 64 independent tasks was 903 vs 500 tok/s in favour of streams; for
+	// ScoreChoices with NSeqMax > 1, set it.
+	KVUnified bool
 	// Embeddings puts the context in embedding mode, which Context.Embed
 	// requires and which disables generation.
 	Embeddings bool
@@ -228,6 +238,7 @@ type ctxRequest struct {
 	NUBatch       uint32  `json:"n_ubatch,omitempty"`
 	NThreads      uint32  `json:"n_threads,omitempty"`
 	NSeqMax       uint32  `json:"n_seq_max,omitempty"`
+	KVUnified     int32   `json:"kv_unified,omitempty"`
 	Embeddings    int     `json:"embeddings,omitempty"`
 	RopeFreqBase  float32 `json:"rope_freq_base,omitempty"`
 	RopeFreqScale float32 `json:"rope_freq_scale,omitempty"`
@@ -529,6 +540,7 @@ func (m *Model) NewContext(p ContextParams) (*Context, error) {
 		NUBatch:       p.NUBatch,
 		NThreads:      p.NThreads,
 		NSeqMax:       p.NSeqMax,
+		KVUnified:     b2i(p.KVUnified),
 		Embeddings:    int(b2i(p.Embeddings)),
 		RopeFreqBase:  p.RopeFreqBase,
 		RopeFreqScale: p.RopeFreqScale,

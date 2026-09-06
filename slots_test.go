@@ -21,7 +21,9 @@ var slotPrompts = []string{
 
 func newSlotsContext(t *testing.T, m *llama.Model, nSlots uint32) (*llama.Context, *llama.Slots) {
 	t.Helper()
-	ctx, err := m.NewContext(llama.ContextParams{NCtx: 512, NSeqMax: nSlots})
+	// NCtx is split across the sequences (no KVUnified), so give each slot
+	// room for the long tasks below.
+	ctx, err := m.NewContext(llama.ContextParams{NCtx: 2048, NSeqMax: nSlots})
 	if err != nil {
 		t.Fatalf("NewContext: %v", err)
 	}
@@ -55,7 +57,24 @@ func TestSlotsMatchGenerate(t *testing.T) {
 		alone[i] = res
 	}
 
-	_, slots := newSlotsContext(t, m, 4)
+	for _, unified := range []bool{false, true} {
+		t.Run(map[bool]string{false: "streams", true: "unified"}[unified], func(t *testing.T) {
+			slotsMatchGenerate(t, m, unified, params, alone)
+		})
+	}
+}
+
+func slotsMatchGenerate(t *testing.T, m *llama.Model, unified bool, params llama.Params, alone []llama.Result) {
+	ctx, err := m.NewContext(llama.ContextParams{NCtx: 2048, NSeqMax: 4, KVUnified: unified})
+	if err != nil {
+		t.Fatalf("NewContext: %v", err)
+	}
+	defer ctx.Close()
+	slots, err := ctx.Slots()
+	if err != nil {
+		t.Fatalf("Slots: %v", err)
+	}
+	defer slots.Close()
 	cmpls := make([]*llama.TaskCompletion, len(slotPrompts))
 	for i, p := range slotPrompts {
 		c, err := slots.Post(context.Background(), llama.Task{Prompt: p, Params: params})
@@ -198,7 +217,7 @@ func TestSlotsCancelViaContext(t *testing.T) {
 // usable for single-sequence work.
 func TestSlotsClose(t *testing.T) {
 	m := load(t)
-	ctx, err := m.NewContext(llama.ContextParams{NCtx: 512, NSeqMax: 2})
+	ctx, err := m.NewContext(llama.ContextParams{NCtx: 2048, NSeqMax: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
