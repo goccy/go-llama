@@ -195,6 +195,13 @@ type genRequest struct {
 
 // wire converts Params into the bridge's parameter object, translating the two
 // places where Go's zero value and llama.cpp's "off" value disagree.
+// taskRequest is the task JSON of llama_ctx_slots_post: a generate request
+// plus the prompt, flat.
+type taskRequest struct {
+	Prompt string `json:"prompt"`
+	genRequest
+}
+
 func (p Params) wire() genRequest {
 	req := genRequest{
 		NPredict:         p.NPredict,
