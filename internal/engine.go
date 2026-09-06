@@ -48,6 +48,7 @@ const (
 	midCtxSlotsCancel
 	midCtxSlotsPost
 	midCtxSlotsStatus
+	midCtxSlotsSystemPrompt
 	midCtxSlotsUpdate
 	midCtxStateLoad
 	midCtxStateSave
@@ -89,23 +90,24 @@ var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 	midCtxSlotsCancel:         wasm2go.Inv_0_14,
 	midCtxSlotsPost:           wasm2go.Inv_0_15,
 	midCtxSlotsStatus:         wasm2go.Inv_0_16,
-	midCtxSlotsUpdate:         wasm2go.Inv_0_17,
-	midCtxStateLoad:           wasm2go.Inv_0_18,
-	midCtxStateSave:           wasm2go.Inv_0_19,
-	midDetokenize:             wasm2go.Inv_0_20,
-	midLoraFree:               wasm2go.Inv_0_21,
-	midLoraLoad:               wasm2go.Inv_0_22,
-	midModelFree:              wasm2go.Inv_0_23,
-	midModelInfo:              wasm2go.Inv_0_24,
-	midModelLoad:              wasm2go.Inv_0_25,
-	midModelLoadProgressAddr:  wasm2go.Inv_0_26,
-	midModelTensors:           wasm2go.Inv_0_27,
-	midTokenToPiece:           wasm2go.Inv_0_28,
-	midTokenize:               wasm2go.Inv_0_29,
-	midWasmBuildInfo:          wasm2go.Inv_0_30,
-	midWasmFree:               wasm2go.Inv_0_31,
-	midWasmInit:               wasm2go.Inv_0_32,
-	midWasmLastError:          wasm2go.Inv_0_33,
+	midCtxSlotsSystemPrompt:   wasm2go.Inv_0_17,
+	midCtxSlotsUpdate:         wasm2go.Inv_0_18,
+	midCtxStateLoad:           wasm2go.Inv_0_19,
+	midCtxStateSave:           wasm2go.Inv_0_20,
+	midDetokenize:             wasm2go.Inv_0_21,
+	midLoraFree:               wasm2go.Inv_0_22,
+	midLoraLoad:               wasm2go.Inv_0_23,
+	midModelFree:              wasm2go.Inv_0_24,
+	midModelInfo:              wasm2go.Inv_0_25,
+	midModelLoad:              wasm2go.Inv_0_26,
+	midModelLoadProgressAddr:  wasm2go.Inv_0_27,
+	midModelTensors:           wasm2go.Inv_0_28,
+	midTokenToPiece:           wasm2go.Inv_0_29,
+	midTokenize:               wasm2go.Inv_0_30,
+	midWasmBuildInfo:          wasm2go.Inv_0_31,
+	midWasmFree:               wasm2go.Inv_0_32,
+	midWasmInit:               wasm2go.Inv_0_33,
+	midWasmLastError:          wasm2go.Inv_0_34,
 }
 
 // NewEngine brings up an independent engine instance: its own wasm module
@@ -502,6 +504,18 @@ func (m *Module) LlamaCtxSlotsCancel(ctx uint64, id int32) (string, error) {
 	buf = pbAppendUint64(buf, 1, ctx)
 	buf = pbAppendInt32(buf, 2, id)
 	resp, err := m.invokeMethod(midCtxSlotsCancel, buf)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+func (m *Module) LlamaCtxSlotsSystemPrompt(ctx uint64, text string, textLen uint32) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, ctx)
+	buf = pbAppendString(buf, 2, text)
+	buf = pbAppendUint64(buf, 3, uint64(textLen))
+	resp, err := m.invokeMethod(midCtxSlotsSystemPrompt, buf)
 	if err != nil {
 		return "", err
 	}

@@ -295,3 +295,88 @@ func TestSlotsRefuseOversizedTask(t *testing.T) {
 		t.Fatal("Post accepted CachePrompt")
 	}
 }
+
+// A system prompt is decoded once and shared: tasks whose prompt starts with
+// it reuse its cells (NCached) and still produce exactly what Generate
+// produces for the full prompt, in both KV layouts.
+func TestSlotsSystemPrompt(t *testing.T) {
+	m := load(t)
+	const system = "You are a router. Answer with one word: the user's intent.\nUser:"
+	tails := []string{" book a table for two", " cancel my order", " what is the weather"}
+	params := llama.Params{NPredict: 8, Temperature: 0}
+	alone := make([]llama.Result, len(tails))
+	for i, tail := range tails {
+		ctx, err := m.NewContext(llama.ContextParams{NCtx: 512})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := ctx.Generate(system+tail, params)
+		ctx.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		alone[i] = res
+	}
+	for _, unified := range []bool{false, true} {
+		t.Run(map[bool]string{false: "streams", true: "unified"}[unified], func(t *testing.T) {
+			ctx, err := m.NewContext(llama.ContextParams{NCtx: 2048, NSeqMax: 4, KVUnified: unified})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ctx.Close()
+			slots, err := ctx.Slots()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer slots.Close()
+			if err := slots.SetSystemPrompt(system); err != nil {
+				t.Fatalf("SetSystemPrompt: %v", err)
+			}
+			st, err := slots.Status()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.NSlots != 3 {
+				t.Errorf("system prompt should occupy one sequence: %+v", st)
+			}
+			var cmpls []*llama.TaskCompletion
+			for _, tail := range tails {
+				c, err := slots.Post(context.Background(), llama.Task{Prompt: system + tail, Params: params})
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmpls = append(cmpls, c)
+			}
+			for i, c := range cmpls {
+				res, err := c.Wait()
+				if err != nil {
+					t.Fatalf("task %d: %v", c.ID(), err)
+				}
+				if res.Text != alone[i].Text || res.NDecoded != alone[i].NDecoded {
+					t.Errorf("task %d: %q (%d), Generate alone %q (%d)", c.ID(), res.Text, res.NDecoded, alone[i].Text, alone[i].NDecoded)
+				}
+				if res.NCached < 8 || res.NCached >= res.NPrompt {
+					t.Errorf("task %d: NCached %d of %d prompt tokens: the system prompt was not reused", c.ID(), res.NCached, res.NPrompt)
+				}
+			}
+			// A prompt that does not start with the system prompt decodes in full.
+			c, err := slots.Post(context.Background(), llama.Task{Prompt: "Once upon a time", Params: params})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := c.Wait()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.NCached != 0 {
+				t.Errorf("unrelated prompt reused %d tokens", res.NCached)
+			}
+			if err := slots.SetSystemPrompt(""); err != nil {
+				t.Fatalf("clear: %v", err)
+			}
+			if st, _ := slots.Status(); st.NSlots != 4 {
+				t.Errorf("clearing the system prompt should release its sequence: %+v", st)
+			}
+		})
+	}
+}

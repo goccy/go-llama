@@ -142,6 +142,36 @@ func (s *Slots) Post(ctx context.Context, task Task) (*TaskCompletion, error) {
 	return t, nil
 }
 
+// SetSystemPrompt decodes text once and shares its KV cells with every task
+// whose prompt starts with it, so such a task decodes only the rest (its
+// Result.NCached counts the reused tokens). This is the system prompt of
+// llama.cpp's server of old: it occupies one of the context's sequences,
+// leaving NSeqMax-1 slots for tasks, and with KVUnified the sharing is free
+// (a copy is metadata); without it each task copies the cells, still far
+// cheaper than decoding them. The text is tokenized on its own, so a task's
+// prompt should be exactly this text followed by the rest; a prompt that
+// tokenizes differently at the boundary simply decodes in full. Refused
+// while tasks are held; an empty text clears it.
+func (s *Slots) SetSystemPrompt(text string) error {
+	if err := s.c.use("slots system prompt"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrSlotsClosed
+	}
+	js, err := s.c.model.inst.e().LlamaCtxSlotsSystemPrompt(s.c.h, text, uint32(len(text)))
+	if err != nil {
+		return err
+	}
+	var out struct {
+		envelope
+		NTokens int `json:"n_tokens"`
+	}
+	return decode("slots system prompt", js, &out)
+}
+
 // Status reports the slots, the tasks and the cache cells in use.
 func (s *Slots) Status() (SlotsStatus, error) {
 	if err := s.c.use("slots status"); err != nil {
