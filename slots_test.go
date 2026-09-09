@@ -359,8 +359,23 @@ func TestSlotsSystemPrompt(t *testing.T) {
 					t.Errorf("task %d: NCached %d of %d prompt tokens: the system prompt was not reused", c.ID(), res.NCached, res.NPrompt)
 				}
 			}
-			// A prompt that does not start with the system prompt decodes in full.
-			c, err := slots.Post(context.Background(), llama.Task{Prompt: "Once upon a time", Params: params})
+			// A prompt that does not start with the system prompt reuses only
+			// what its tokens share with it (a BOS token, on vocabularies that
+			// add one).
+			const unrelated = "Once upon a time"
+			sysToks, err := m.Tokenize(system, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unrelToks, err := m.Tokenize(unrelated, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			shared := 0
+			for shared < len(sysToks) && shared < len(unrelToks)-1 && sysToks[shared] == unrelToks[shared] {
+				shared++
+			}
+			c, err := slots.Post(context.Background(), llama.Task{Prompt: unrelated, Params: params})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -368,8 +383,8 @@ func TestSlotsSystemPrompt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res.NCached != 0 {
-				t.Errorf("unrelated prompt reused %d tokens", res.NCached)
+			if res.NCached != shared {
+				t.Errorf("unrelated prompt reused %d tokens, its tokens share %d with the system prompt", res.NCached, shared)
 			}
 			if err := slots.SetSystemPrompt(""); err != nil {
 				t.Fatalf("clear: %v", err)
