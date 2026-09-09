@@ -203,13 +203,23 @@ type ContextParams struct {
 	// threads-enabled build (BuildInfo.Threads); the single-threaded wasm
 	// clamps to 1.
 	NThreads uint32
-	// NSeqMax is the number of sequences the context can hold at once. A
-	// value > 1 turns on the unified KV cache: NCtx stays the TOTAL cell
-	// budget shared by every sequence, and ScoreChoices batches its
-	// teacher-forced candidates into one decode (one sequence per candidate,
-	// all sharing the stem). Zero or 1 keeps the single-sequence default,
-	// where ScoreChoices decodes candidates one at a time.
+	// NSeqMax is the number of sequences the context can hold at once: the
+	// slots of a Slots, or the candidates ScoreChoices decodes in one batch
+	// (one sequence per candidate, all sharing the stem). Zero or 1 is the
+	// single-sequence default, where ScoreChoices decodes candidates one at
+	// a time.
 	NSeqMax uint32
+	// KVUnified chooses how the NSeqMax sequences share the KV cache, as
+	// llama.cpp's kv_unified does. False, the default, gives each sequence
+	// its own stream of NCtx / NSeqMax cells: attention over a sequence then
+	// costs only its own cells, which is what independent tasks on a Slots
+	// want. True shares one buffer of NCtx cells across the sequences, where
+	// copying a sequence is metadata rather than a copy: what ScoreChoices'
+	// batched path leans on (its candidates all share the stem), and what a
+	// prompt prefix shared across slots needs. The measured difference for
+	// 64 independent tasks was 903 vs 500 tok/s in favour of streams; for
+	// ScoreChoices with NSeqMax > 1, set it.
+	KVUnified bool
 	// Embeddings puts the context in embedding mode, which Context.Embed
 	// requires and which disables generation.
 	Embeddings bool
@@ -228,6 +238,7 @@ type ctxRequest struct {
 	NUBatch       uint32  `json:"n_ubatch,omitempty"`
 	NThreads      uint32  `json:"n_threads,omitempty"`
 	NSeqMax       uint32  `json:"n_seq_max,omitempty"`
+	KVUnified     int32   `json:"kv_unified,omitempty"`
 	Embeddings    int     `json:"embeddings,omitempty"`
 	RopeFreqBase  float32 `json:"rope_freq_base,omitempty"`
 	RopeFreqScale float32 `json:"rope_freq_scale,omitempty"`
@@ -417,25 +428,7 @@ func (m *Model) TokenToPiece(token int32, renderSpecial bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var out struct {
-		envelope
-		Text string `json:"text"`
-		B64  string `json:"b64"`
-	}
-	if err := decode("token_to_piece", js, &out); err != nil {
-		return "", err
-	}
-	// A byte-fallback token holds a partial UTF-8 sequence, which the JSON
-	// text field cannot carry losslessly; the base64 field carries the raw
-	// bytes exactly as llama.cpp's llama_token_to_piece returns them.
-	if out.B64 != "" {
-		raw, err := base64.StdEncoding.DecodeString(out.B64)
-		if err != nil {
-			return "", fmt.Errorf("token_to_piece: bad b64 payload: %w", err)
-		}
-		return string(raw), nil
-	}
-	return out.Text, nil
+	return decodeText("token_to_piece", js)
 }
 
 // ApplyChatTemplate renders messages into a prompt with the model's chat
@@ -547,6 +540,7 @@ func (m *Model) NewContext(p ContextParams) (*Context, error) {
 		NUBatch:       p.NUBatch,
 		NThreads:      p.NThreads,
 		NSeqMax:       p.NSeqMax,
+		KVUnified:     b2i(p.KVUnified),
 		Embeddings:    int(b2i(p.Embeddings)),
 		RopeFreqBase:  p.RopeFreqBase,
 		RopeFreqScale: p.RopeFreqScale,
@@ -624,10 +618,18 @@ func (c *Context) GenerateWithDraft(draft *Context, prompt string, p Params, nDr
 	var out struct {
 		envelope
 		Result
+		B64 string `json:"b64"`
 	}
 	if err := decode("generate", js, &out); err != nil {
 		return Result{}, err
 	}
+	// Result.Text must be the bytes the token sink saw, not a U+FFFD-patched
+	// rendering of them; see decodeText.
+	text, err := textFields{Text: out.Text, B64: out.B64}.bytes("generate")
+	if err != nil {
+		return Result{}, err
+	}
+	out.Result.Text = text
 	return out.Result, nil
 }
 
@@ -855,10 +857,18 @@ func (c *Context) generate(prompt string, req genRequest, sink bridge.Token_Sink
 	var out struct {
 		envelope
 		Result
+		B64 string `json:"b64"`
 	}
 	if err := decode("generate", js, &out); err != nil {
 		return Result{}, err
 	}
+	// Result.Text must be the bytes the token sink saw, not a U+FFFD-patched
+	// rendering of them; see decodeText.
+	text, err := textFields{Text: out.Text, B64: out.B64}.bytes("generate")
+	if err != nil {
+		return Result{}, err
+	}
+	out.Result.Text = text
 	return out.Result, nil
 }
 
@@ -884,14 +894,41 @@ func decode(what, js string, v enveloped) error {
 	return v.err(what)
 }
 
-// decodeText is the common shape of the calls that return just a string.
+// decodeText is the common shape of the calls that return model-produced
+// bytes: a "text" field plus a "b64" copy of the same bytes.
+//
+// Tokenizers are byte-level, so a piece can be a partial UTF-8 sequence (see
+// utf8.go). The JSON text field cannot carry that losslessly — encoding/json
+// replaces invalid UTF-8 with U+FFFD — while the token-sink callback hands
+// Stream the raw bytes; b64 carries them exactly, so Result.Text and the
+// streamed pieces agree byte for byte. text alone is accepted for bridges
+// that predate the b64 field.
 func decodeText(what, js string) (string, error) {
 	var out struct {
 		envelope
-		Text string `json:"text"`
+		textFields
 	}
 	if err := decode(what, js, &out); err != nil {
 		return "", err
 	}
-	return out.Text, nil
+	return out.textFields.bytes(what)
+}
+
+// textFields is the text-plus-b64 pair every bridge result that carries
+// model-produced bytes uses.
+type textFields struct {
+	Text string `json:"text"`
+	B64  string `json:"b64"`
+}
+
+// bytes returns the raw bytes: the b64 field when present, else the text.
+func (t textFields) bytes(what string) (string, error) {
+	if t.B64 == "" {
+		return t.Text, nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(t.B64)
+	if err != nil {
+		return "", fmt.Errorf("llama: %s: bad b64 payload: %w", what, err)
+	}
+	return string(raw), nil
 }

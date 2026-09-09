@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	llama "github.com/goccy/go-llama"
 )
@@ -248,9 +249,17 @@ func TestStreamDeliversTextWhileGenerating(t *testing.T) {
 		t.Errorf("streamed text differs from the returned text:\n stream: %q\n return: %q", got.String(), res.Text)
 	}
 	// One callback per decoded token, so delivery is genuinely incremental
-	// rather than one dump at the end.
-	if len(pieces) != res.NDecoded {
-		t.Errorf("expected one piece per decoded token: %d pieces, %d tokens", len(pieces), res.NDecoded)
+	// rather than one dump at the end. A token that ends part-way through a
+	// multi-byte character is held back and delivered together with the token
+	// that completes it (see utf8.go), so a piece may cover more than one
+	// token, but never fewer.
+	if len(pieces) > res.NDecoded || len(pieces) < 2 {
+		t.Errorf("expected about one piece per decoded token: %d pieces, %d tokens", len(pieces), res.NDecoded)
+	}
+	for i, p := range pieces[:len(pieces)-1] {
+		if !utf8.ValidString(p) && utf8.ValidString(got.String()) {
+			t.Errorf("piece %d %q is not valid UTF-8 although the whole text is: a character was split across callbacks", i, p)
+		}
 	}
 	if res.NDecoded != want {
 		t.Errorf("expected %d tokens, got %d", want, res.NDecoded)
@@ -259,6 +268,60 @@ func TestStreamDeliversTextWhileGenerating(t *testing.T) {
 		t.Errorf("first piece arrived at %v, at the very end of a %v generation", firstAt, total)
 	}
 	t.Logf("%d pieces, first after %v, total %v", len(pieces), firstAt, total)
+}
+
+// A byte-level tokenizer has tokens that render to a single byte >= 0x80: not
+// valid UTF-8 on their own. Detokenize must return exactly those bytes, the
+// same way TokenToPiece and Stream's callback do, rather than a U+FFFD
+// rendering of them.
+func TestDetokenizeKeepsPartialUTF8(t *testing.T) {
+	m := load(t)
+	var (
+		byteTok   int32 = -1
+		bytePiece string
+	)
+	for tok := int32(0); tok < 4096 && byteTok < 0; tok++ {
+		piece, err := m.TokenToPiece(tok, false)
+		if err != nil {
+			t.Fatalf("TokenToPiece(%d): %v", tok, err)
+		}
+		if len(piece) == 1 && piece[0] >= 0x80 {
+			byteTok, bytePiece = tok, piece
+		}
+	}
+	if byteTok < 0 {
+		t.Skip("no byte-fallback token among the first 4096 tokens of this vocabulary")
+	}
+	got, err := m.Detokenize([]int32{byteTok}, false)
+	if err != nil {
+		t.Fatalf("Detokenize: %v", err)
+	}
+	if got != bytePiece {
+		t.Errorf("Detokenize(%d) = %q, want the raw byte %q", byteTok, got, bytePiece)
+	}
+	// Two byte tokens forming one character must come back as that character.
+	half1, half2 := int32(-1), int32(-1)
+	for tok := int32(0); tok < 4096 && (half1 < 0 || half2 < 0); tok++ {
+		piece, err := m.TokenToPiece(tok, false)
+		if err != nil {
+			t.Fatalf("TokenToPiece(%d): %v", tok, err)
+		}
+		if len(piece) == 1 && piece[0] == 0xC3 {
+			half1 = tok
+		}
+		if len(piece) == 1 && piece[0] == 0xA9 {
+			half2 = tok
+		}
+	}
+	if half1 >= 0 && half2 >= 0 {
+		got, err := m.Detokenize([]int32{half1, half2}, false)
+		if err != nil {
+			t.Fatalf("Detokenize: %v", err)
+		}
+		if got != "\u00e9" {
+			t.Errorf("Detokenize(0xC3, 0xA9) = %q, want %q", got, "\u00e9")
+		}
+	}
 }
 
 func TestStreamNilCallbackMatchesGenerate(t *testing.T) {

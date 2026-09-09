@@ -127,6 +127,52 @@ memory (never calling into the engine), which the generation loop reads once per
 token. It is safe to call from any goroutine while a generation runs; `Generate`
 then returns what it has with `Reason == StopInterrupted`.
 
+## Slots: many requests on one context
+
+A `Context` created with `NSeqMax` slots can run that many tasks at once —
+continuous batching, in llama.cpp's server vocabulary (slot, task, post,
+system prompt). One scheduling step decodes a single batch drawn from every
+busy slot, so the slots share the per-step cost instead of each paying it.
+
+```go
+ctx, _ := model.NewContext(llama.ContextParams{NCtx: 8192, NSeqMax: 32})
+slots, _ := ctx.Slots()
+defer slots.Close()
+
+// Optional: an instruction every request starts with is decoded once and
+// shared; a task that starts with it decodes only the rest.
+slots.SetSystemPrompt(instruction)
+
+task := llama.Task{Prompt: instruction + userText, Params: llama.Params{NPredict: 16}}
+cmpl, err := slots.Post(ctx, task)        // ctx is a context.Context: cancel it to drop the task
+for out := range cmpl.Outputs() {         // each token as it is produced (optional)
+	fmt.Print(out.Text)
+}
+res, err := cmpl.Wait()                    // the same Result Generate returns
+```
+
+`Task` is a plain value; `Post` never modifies it and returns the task's
+`TaskCompletion`. `Outputs` is pull-based — outputs are kept until read, so a
+slow reader never stalls the batch — and `Result` returns the finished result
+without waiting (`ErrTaskRunning` before). A task waits for a free slot in
+FIFO order and for enough free cells; its prompt plus `NPredict` must fit a
+sequence's window. A greedy task produces exactly what `Generate` produces for
+the same prompt when the prompt is decoded in the same chunks; a long prompt
+split differently across steps can land on the other side of a near-tie, as
+`Generate` itself does with a different `NBatch`.
+
+`ContextParams.KVUnified` follows llama.cpp's `kv_unified`: off (the default)
+gives each sequence its own stream of `NCtx / NSeqMax` cells, the right layout
+for independent tasks; on shares one buffer, which makes the system prompt's
+sharing free and is what `ScoreChoices` with `NSeqMax > 1` relies on. While
+a `Slots` holds tasks the context's single-sequence methods refuse.
+
+Measured on an M-series laptop with 8 threads and a 0.5B Q8_0 model, 100
+requests arriving at once (a 45-token shared instruction plus a short user
+part, 16 tokens each): eight forked instances completed them at p50 4.3 s /
+p99 7.8 s (205 tok/s); 32 slots with the shared system prompt at p50 1.5 s /
+p99 2.4 s (655 tok/s), first token at p50 0.85 s.
+
 ## Memory
 
 wasm32 caps linear memory at 4 GiB, and the model weights plus every context's

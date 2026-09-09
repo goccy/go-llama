@@ -167,7 +167,7 @@ func TestScoreChoicesSeqBatched(t *testing.T) {
 
 	// NSeqMax 4 forces chunking (8 multi-token candidates over 3 spare
 	// sequences per group).
-	bat, err := m.NewContext(llama.ContextParams{NCtx: 256, NSeqMax: 4})
+	bat, err := m.NewContext(llama.ContextParams{NCtx: 256, NSeqMax: 4, KVUnified: true})
 	if err != nil {
 		t.Fatal(err)
 	}
