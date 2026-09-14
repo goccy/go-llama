@@ -15,12 +15,10 @@ package llama
 //     idiom the sibling wasm2go embeddings use for their interrupt flags.
 
 import (
-	"encoding/binary"
 	"fmt"
 	"runtime"
 
 	bridge "github.com/goccy/go-llama/internal"
-	"github.com/goccy/llamawasm2go/base"
 )
 
 // Stream generates from prompt like Generate and calls onPiece with each piece
@@ -39,6 +37,8 @@ func (c *Context) Stream(prompt string, p Params, onPiece func(string)) (Result,
 	if onPiece == nil {
 		return c.Generate(prompt, p)
 	}
+	// generate holds the context open for the generation; this is only the
+	// early answer for a closed context, before a sink is installed.
 	if err := c.use("stream"); err != nil {
 		return Result{}, err
 	}
@@ -92,28 +92,13 @@ func (s *pieceSink) flush() {
 // the C stack with it. Generate then returns what it has, with
 // Reason == StopInterrupted.
 //
-// Safe to call from any goroutine, including while a generation runs. A call
+// Safe to call from any goroutine, including while a generation runs, and
+// while a Close is waiting for one (Close interrupts it itself). A call
 // when nothing is running is a no-op: the flag is cleared when generation
 // starts.
 func (c *Context) Interrupt() error {
-	if err := c.use("interrupt"); err != nil {
-		return err
+	if c.model.inst.closed.Load() {
+		return fmt.Errorf("llama: interrupt: %w", ErrInstanceClosed)
 	}
-	m := c.model.inst.e().Base()
-	if m == nil {
-		return fmt.Errorf("llama: interrupt: engine is not running")
-	}
-	var err error
-	// AccessMemory holds the lock memory.grow takes, so for the duration of
-	// the write linear memory can neither be resliced nor relocated.
-	base.AccessMemory(m, func(mem []byte) {
-		addr := int(c.interruptAddr)
-		if addr <= 0 || addr+4 > len(mem) {
-			err = fmt.Errorf("llama: interrupt: address %d is outside linear memory", c.interruptAddr)
-			return
-		}
-		// One aligned word, which the generation loop reads once per token.
-		binary.LittleEndian.PutUint32(mem[addr:], 1)
-	})
-	return err
+	return c.model.inst.interrupt(c.st)
 }

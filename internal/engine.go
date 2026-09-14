@@ -19,9 +19,12 @@ package internal
 // service/method number, or an entry point.
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	wasm2go "github.com/goccy/llamawasm2go"
 	"github.com/goccy/llamawasm2go/base"
@@ -33,10 +36,12 @@ import (
 const (
 	midChatApplyTemplate int32 = iota
 	midCtxAttachThreadpool
+	midCtxDbgTrapNextGraph
 	midCtxEmbed
 	midCtxEmbedTokens
 	midCtxEval
 	midCtxFree
+	midCtxFreeThreadpool
 	midCtxGenerate
 	midCtxGenerateSpeculative
 	midCtxInterruptAddr
@@ -75,39 +80,41 @@ const (
 var invokers = [midCount]func(*base.Module, wptr, wptr) (int64, error){
 	midChatApplyTemplate:      wasm2go.Inv_0_0,
 	midCtxAttachThreadpool:    wasm2go.Inv_0_1,
-	midCtxEmbed:               wasm2go.Inv_0_2,
-	midCtxEmbedTokens:         wasm2go.Inv_0_3,
-	midCtxEval:                wasm2go.Inv_0_4,
-	midCtxFree:                wasm2go.Inv_0_5,
-	midCtxGenerate:            wasm2go.Inv_0_6,
-	midCtxGenerateSpeculative: wasm2go.Inv_0_7,
-	midCtxInterruptAddr:       wasm2go.Inv_0_8,
-	midCtxLoraSet:             wasm2go.Inv_0_9,
-	midCtxNew:                 wasm2go.Inv_0_10,
-	midCtxReset:               wasm2go.Inv_0_11,
-	midCtxScore:               wasm2go.Inv_0_12,
-	midCtxScoreChoices:        wasm2go.Inv_0_13,
-	midCtxSlotsCancel:         wasm2go.Inv_0_14,
-	midCtxSlotsPost:           wasm2go.Inv_0_15,
-	midCtxSlotsStatus:         wasm2go.Inv_0_16,
-	midCtxSlotsSystemPrompt:   wasm2go.Inv_0_17,
-	midCtxSlotsUpdate:         wasm2go.Inv_0_18,
-	midCtxStateLoad:           wasm2go.Inv_0_19,
-	midCtxStateSave:           wasm2go.Inv_0_20,
-	midDetokenize:             wasm2go.Inv_0_21,
-	midLoraFree:               wasm2go.Inv_0_22,
-	midLoraLoad:               wasm2go.Inv_0_23,
-	midModelFree:              wasm2go.Inv_0_24,
-	midModelInfo:              wasm2go.Inv_0_25,
-	midModelLoad:              wasm2go.Inv_0_26,
-	midModelLoadProgressAddr:  wasm2go.Inv_0_27,
-	midModelTensors:           wasm2go.Inv_0_28,
-	midTokenToPiece:           wasm2go.Inv_0_29,
-	midTokenize:               wasm2go.Inv_0_30,
-	midWasmBuildInfo:          wasm2go.Inv_0_31,
-	midWasmFree:               wasm2go.Inv_0_32,
-	midWasmInit:               wasm2go.Inv_0_33,
-	midWasmLastError:          wasm2go.Inv_0_34,
+	midCtxDbgTrapNextGraph:    wasm2go.Inv_0_2,
+	midCtxEmbed:               wasm2go.Inv_0_3,
+	midCtxEmbedTokens:         wasm2go.Inv_0_4,
+	midCtxEval:                wasm2go.Inv_0_5,
+	midCtxFree:                wasm2go.Inv_0_6,
+	midCtxFreeThreadpool:      wasm2go.Inv_0_7,
+	midCtxGenerate:            wasm2go.Inv_0_8,
+	midCtxGenerateSpeculative: wasm2go.Inv_0_9,
+	midCtxInterruptAddr:       wasm2go.Inv_0_10,
+	midCtxLoraSet:             wasm2go.Inv_0_11,
+	midCtxNew:                 wasm2go.Inv_0_12,
+	midCtxReset:               wasm2go.Inv_0_13,
+	midCtxScore:               wasm2go.Inv_0_14,
+	midCtxScoreChoices:        wasm2go.Inv_0_15,
+	midCtxSlotsCancel:         wasm2go.Inv_0_16,
+	midCtxSlotsPost:           wasm2go.Inv_0_17,
+	midCtxSlotsStatus:         wasm2go.Inv_0_18,
+	midCtxSlotsSystemPrompt:   wasm2go.Inv_0_19,
+	midCtxSlotsUpdate:         wasm2go.Inv_0_20,
+	midCtxStateLoad:           wasm2go.Inv_0_21,
+	midCtxStateSave:           wasm2go.Inv_0_22,
+	midDetokenize:             wasm2go.Inv_0_23,
+	midLoraFree:               wasm2go.Inv_0_24,
+	midLoraLoad:               wasm2go.Inv_0_25,
+	midModelFree:              wasm2go.Inv_0_26,
+	midModelInfo:              wasm2go.Inv_0_27,
+	midModelLoad:              wasm2go.Inv_0_28,
+	midModelLoadProgressAddr:  wasm2go.Inv_0_29,
+	midModelTensors:           wasm2go.Inv_0_30,
+	midTokenToPiece:           wasm2go.Inv_0_31,
+	midTokenize:               wasm2go.Inv_0_32,
+	midWasmBuildInfo:          wasm2go.Inv_0_33,
+	midWasmFree:               wasm2go.Inv_0_34,
+	midWasmInit:               wasm2go.Inv_0_35,
+	midWasmLastError:          wasm2go.Inv_0_36,
 }
 
 // NewEngine brings up an independent engine instance: its own wasm module
@@ -121,12 +128,12 @@ func NewEngine(opts Options) (m *Module, err error) {
 	if imgErr != nil {
 		return newPrivateEngine(opts)
 	}
-	m = &Module{}
-	m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
-		mem, img.Size())
+	m = newModule()
+	m.adopt(wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+		mem, img.Size()))
 	engineMmaps.Store(m, mem)
 	if err := initEngine(m); err != nil {
-		m.Close()
+		_ = m.Close()
 		return nil, err
 	}
 	return m, nil
@@ -140,19 +147,20 @@ func NewEngine(opts Options) (m *Module, err error) {
 // builder instance is discarded after its memory is copied into the image
 // and an mmap-backed one would leak its mapping.
 func newPrivateEngine(opts Options) (m *Module, err error) {
-	m = &Module{}
+	m = newModule()
 	env := envStubs{m: m}
 	wm := wasmifyStubs{m: m}
 	wasi := engineWASI(opts)
 	if opts.MemoryReserveBytes > 0 {
-		m.g = wasm2go.NewWithWASIReserve(wasi, env, wm, opts.MemoryReserveBytes)
+		m.adopt(wasm2go.NewWithWASIReserve(wasi, env, wm, opts.MemoryReserveBytes))
 	} else {
-		m.g = wasm2go.NewWithWASI(wasi, env, wm)
+		m.adopt(wasm2go.NewWithWASI(wasi, env, wm))
 	}
 	if opts.MaxMemoryBytes > 0 {
 		wasm2go.SetMaxMemory(m.g, opts.MaxMemoryBytes)
 	}
 	if err := initEngine(m); err != nil {
+		_ = m.Close()
 		return nil, err
 	}
 	return m, nil
@@ -186,29 +194,190 @@ func initEngine(m *Module) (err error) {
 // not modify — so it rides in a side table keyed by the module.
 var engineMmaps sync.Map // *Module -> []byte
 
-// Closed reports whether Close has detached the engine from its memory.
+// engineGates holds each engine's gate (engineGate): the lock that orders
+// an engine's calls against its Close, what it knows of its threads, and
+// whether it trapped. A call holds the lock shared for its duration and
+// checks Closed under it; Close takes it exclusively. Without it a call
+// that passed its closed-check just before Close detached the memory
+// would run the transpiled entry over a nil memory — a panic, not an
+// error, and on a goroutine of the caller's (a Slots scheduler, say) with
+// nothing to recover it. The lock nests outside m.mu on both paths.
+//
+// The entry is stored when the engine is created (newModule) and deleted
+// when it is released; a missing entry means closed, and nothing is ever
+// inserted afterwards, so a dead engine is not pinned by its own gate. A
+// side table for the same reason as engineMmaps.
+var engineGates sync.Map // *Module -> *engineGate
+
+type engineGate struct {
+	mu sync.RWMutex
+	// threads counts the engine's wasi threads from the start of each to
+	// its goroutine's end. A guest's pthread_join returns as soon as the
+	// thread has published its exit, while the thread still has an
+	// atomic notify to make in the memory; the unmap waits for the
+	// goroutines themselves.
+	threads atomic.Int64
+	// trapped is the first trap the engine took, if any. C++ frames a
+	// trap unwound ran no destructors: whatever they held — locks, heap
+	// blocks, half-built state — stays as it was, so the engine is only
+	// good for tearing down afterwards.
+	trapped atomic.Pointer[TrapError]
+}
+
+// newModule is the constructor every engine goes through: it registers
+// the engine's gate. adopt then hands it the transpiled module.
+func newModule() *Module {
+	m := &Module{}
+	engineGates.Store(m, &engineGate{})
+	return m
+}
+
+// adopt installs the transpiled module and hooks its thread entry so the
+// gate counts the engine's threads.
+func (m *Module) adopt(g *base.Module) {
+	m.g = g
+	gate, _ := engineGates.Load(m)
+	start := g.ThreadStart64
+	if start == nil {
+		return
+	}
+	g.ThreadStart64 = func(child *base.Module, tid int32, arg int64) {
+		gate.(*engineGate).threads.Add(1)
+		defer gate.(*engineGate).threads.Add(-1)
+		start(child, tid, arg)
+	}
+}
+
+// threadExitWait is how long Close waits for the engine's threads to be
+// gone after every context of it was freed (which joined them): they need
+// microseconds, and a wait this long means one never will.
+const threadExitWait = 10 * time.Second
+
+// ErrThreadsAlive is returned by Close when the engine's threads did not
+// exit in time; the memory was kept mapped rather than unmapped under
+// them.
+var ErrThreadsAlive = errors.New("threads of the engine are still running; memory kept mapped")
+
+// ErrEngineClosed is returned by every call on a closed engine. Its text
+// is the user-facing one: the public package exposes it as its own
+// instance-closed sentinel.
+var ErrEngineClosed = errors.New("instance is closed")
+
+// GuestError is a failure the guest reported normally: the bridge's own
+// error object in the reply, with the guest's state as the call left it.
+// It is the third kind of call error next to ErrEngineClosed and
+// TrapError, and the only one after which the guest is known to be
+// consistent.
+type GuestError struct {
+	Err error
+}
+
+func (e *GuestError) Error() string { return e.Err.Error() }
+func (e *GuestError) Unwrap() error { return e.Err }
+
+// TrapError is an engine call that trapped: the guest hit an unreachable
+// (a failed assertion, an out-of-bounds access) and unwound to the call
+// boundary. The call's own frames are gone, but whatever guest state it
+// was changing is left as it was at the trap — in particular a pool of
+// worker threads the call was about to create, join or hand over may be
+// in any state. Callers that release memory decide on it with errors.As.
+type TrapError struct {
+	Err error
+	// Refused is set when the call never entered the guest: the engine
+	// had trapped earlier (Err names that trap) and takes only teardown
+	// calls since. The guest's state is whatever that earlier trap left,
+	// not something this call changed.
+	Refused bool
+}
+
+func (e *TrapError) Error() string { return e.Err.Error() }
+func (e *TrapError) Unwrap() error { return e.Err }
+
+// Closed reports whether Close (or Abandon) has detached the engine from
+// its memory.
 func (m *Module) Closed() bool { return m.g == nil || m.g.Memory == nil }
 
 // Close releases the engine's memory. An engine backed by a copy-on-write
 // mapping owns that mapping — it is not Go heap, so it must be unmapped here
 // rather than left to the GC; a private allocation is simply detached for the
-// GC to reclaim. Either way the module is left memoryless, so the hand-written
-// call surfaces (which check Closed) refuse late calls instead of touching
-// freed pages. Idempotent.
-func (m *Module) Close() {
+// GC to reclaim. Either way the module is left memoryless, and the
+// data-plane calls (invokeMethod) refuse to run afterwards, so a late call
+// gets ErrEngineClosed instead of touching freed pages. Idempotent.
+//
+// The caller guarantees no guest thread of this engine is still running:
+// a wasi thread shares the memory but not this Module's view of it, so it
+// would not see the detach and would trap against the unmapped pages, on
+// its own goroutine, with nothing to recover it. When that cannot be
+// guaranteed, Abandon instead.
+//
+// Close returns ErrThreadsAlive when a thread of the engine is still
+// running after threadExitWait: the memory is then kept, as by Abandon.
+func (m *Module) Close() error { return m.release(true) }
+
+// Abandon is Close without the unmap: the engine is detached and refuses
+// calls like a closed one, but its memory stays mapped for the life of the
+// process. For an engine whose guest threads may still be alive — a call
+// that should have joined them trapped — this leaks the mapping instead of
+// pulling it out from under them. It is also how a snapshot builder's
+// engine is retired: its memory IS the image, owned by the image from
+// then on.
+func (m *Module) Abandon() { _ = m.release(false) }
+
+func (m *Module) release(unmap bool) error {
+	g, ok := engineGates.Load(m)
+	if !ok {
+		return nil // released already
+	}
+	gate := g.(*engineGate)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Closed() {
-		return
+		return nil
+	}
+	var err error
+	if unmap && !threadsGone(&gate.threads, threadExitWait) {
+		unmap = false
+		err = ErrThreadsAlive
 	}
 	// Detach the module from its memory before releasing it, so a stray late
-	// call fails a closed-check instead of touching unmapped pages.
+	// call fails a closed-check instead of touching unmapped pages. Memory
+	// and M are this Module's own view; MemSize is shared by pointer with
+	// every wasi thread's copy of the module (ThreadLaunch), so it is the
+	// one thing a live thread would see: zero it only when the memory does
+	// go away, so that a thread still running in an abandoned memory keeps
+	// its bound and runs on rather than trapping against zero.
+	// Under MemMu as well: base.AccessMemory (Interrupt's write of the
+	// interrupt word) holds it while it touches the memory, so it either
+	// completes before the detach or finds no memory afterwards, never a
+	// page that was unmapped under it.
+	m.g.MemMu.Lock()
+	defer m.g.MemMu.Unlock()
 	m.g.Memory = nil
 	m.g.M = nil
-	m.g.MemSize.Store(0)
-	if mem, ok := engineMmaps.LoadAndDelete(m); ok {
-		base.UnmapMemory(mem.([]byte))
+	mem, mapped := engineMmaps.LoadAndDelete(m)
+	if unmap {
+		m.g.MemSize.Store(0)
+		if mapped {
+			base.UnmapMemory(mem.([]byte))
+		}
 	}
+	engineGates.Delete(m)
+	return err
+}
+
+// threadsGone reports whether the thread count reaches zero within d.
+// Polled rather than waited on, so nothing outlives the deadline.
+func threadsGone(n *atomic.Int64, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for n.Load() > 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	return true
 }
 
 // ImageBacked reports whether this engine's memory is a copy-on-write map of
@@ -227,13 +396,60 @@ func (m *Module) Base() *base.Module { return m.g }
 // standard bridge error check. The single seam every data-plane method funnels
 // through; it reuses the generated (m *Module) invoke, the invokers entry-point
 // table and the protobuf helpers, so a method body is only its marshalling.
+//
+// Three kinds of error come back, told apart by type, never by message:
+// ErrEngineClosed for a call after Close; a *TrapError when the guest
+// trapped; and a *GuestError when the guest reported a failure normally.
 func (m *Module) invokeMethod(mid int32, req []byte) ([]byte, error) {
-	resp, err := m.invoke(0, mid, req, invokers[mid])
+	resp, err := m.invokeGated(0, mid, req, invokers[mid], teardownMethods[mid])
 	if err != nil {
 		return nil, err
 	}
 	if e := pbExtractError(resp); e != nil {
-		return nil, e
+		return nil, &GuestError{Err: e}
+	}
+	return resp, nil
+}
+
+// teardownMethods are the calls an engine that trapped still takes: the
+// frees, which are what makes the engine safe to release (a context
+// free joins its threadpool workers). Everything else is refused after a
+// trap; see engineGate.trapped.
+var teardownMethods = map[int32]bool{
+	midCtxFree:           true,
+	midCtxFreeThreadpool: true,
+	midModelFree:         true,
+	midLoraFree:          true,
+	midWasmFree:          true,
+}
+
+// invokeGated is invoke under the engine's gate: ErrEngineClosed after
+// Close, a *TrapError when the guest trapped (the only error the generated
+// invoke produces — its entry points recover a trap into an error and
+// nothing else) or when it trapped earlier and this is not a teardown
+// call, the raw reply otherwise. Never called from inside a callback the
+// guest makes during a gated call: the gate is a read-write lock, and a
+// second shared hold on the same goroutine deadlocks against a Close
+// waiting to take it exclusively.
+func (m *Module) invokeGated(serviceID, methodID int32, req []byte, call func(*base.Module, wptr, wptr) (int64, error), teardown bool) ([]byte, error) {
+	g, ok := engineGates.Load(m)
+	if !ok {
+		return nil, ErrEngineClosed
+	}
+	gate := g.(*engineGate)
+	gate.mu.RLock()
+	defer gate.mu.RUnlock()
+	if m.Closed() {
+		return nil, ErrEngineClosed
+	}
+	if t := gate.trapped.Load(); t != nil && !teardown {
+		return nil, &TrapError{Err: fmt.Errorf("engine trapped earlier: %w", t.Err), Refused: true}
+	}
+	resp, err := m.invoke(serviceID, methodID, req, call)
+	if err != nil {
+		trap := &TrapError{Err: err}
+		gate.trapped.CompareAndSwap(nil, trap)
+		return nil, trap
 	}
 	return resp, nil
 }
@@ -252,6 +468,8 @@ func (s *tokenSink) isToken_Sink()  {}
 func (s *tokenSink) OnPiece(piece string) error {
 	buf := pbAppendHandle(pbNewBuf(), 1, s.ptr)
 	buf = pbAppendString(buf, 2, piece)
+	// Ungated on purpose: OnPiece runs inside the generation that owns the
+	// sink, which already holds the engine's gate (see invokeGated).
 	resp, err := s.m.invoke(1, 0, buf, wasm2go.Inv_1_0)
 	if err != nil {
 		return err
@@ -266,7 +484,7 @@ func (m *Module) NewTokenSink(impl Token_SinkCallback) (Token_SinkNode, error) {
 	adapter := &token_SinkCallbackAdapter{impl: impl}
 	id := m.registerCB(adapter)
 	buf := pbAppendInt32(pbNewBuf(), 1, id)
-	resp, err := m.invoke(1, 1, buf, wasm2go.Inv_1_1)
+	resp, err := m.invokeGated(1, 1, buf, wasm2go.Inv_1_1, false)
 	if err == nil {
 		err = pbExtractError(resp)
 	}
@@ -279,9 +497,9 @@ func (m *Module) NewTokenSink(impl Token_SinkCallback) (Token_SinkNode, error) {
 		// A leaked sink can outlive its engine, and a panic in a finalizer
 		// goroutine is fatal — never let the guest-side free escalate.
 		defer func() { _ = recover() }()
-		if s.ptr != 0 && !s.m.Closed() {
+		if s.ptr != 0 {
 			b := pbAppendHandle(pbNewBuf(), 1, s.ptr)
-			_, _ = s.m.invoke(1, 2, b, wasm2go.Inv_1_2)
+			_, _ = s.m.invokeGated(1, 2, b, wasm2go.Inv_1_2, true)
 		}
 		s.ptr = 0
 		s.m.unregisterCB(id)
@@ -367,6 +585,29 @@ func (m *Module) LlamaCtxFree(ctx uint64) error {
 	buf = pbAppendUint64(buf, 1, ctx)
 	_, err := m.invokeMethod(midCtxFree, buf)
 	return err
+}
+
+// LlamaCtxDbgTrapNextGraph arms the bridge's test hook: the next graph
+// computed on ctx traps on the main thread, mid-graph, with the pool's
+// workers waiting at a barrier. For tests of the teardown after a trap.
+func (m *Module) LlamaCtxDbgTrapNextGraph(ctx uint64) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, ctx)
+	resp, err := m.invokeMethod(midCtxDbgTrapNextGraph, buf)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
+}
+
+func (m *Module) LlamaCtxFreeThreadpool(ctx uint64) (string, error) {
+	buf := pbNewBuf()
+	buf = pbAppendUint64(buf, 1, ctx)
+	resp, err := m.invokeMethod(midCtxFreeThreadpool, buf)
+	if err != nil {
+		return "", err
+	}
+	return readScalarAtField(resp, 1, (*pbReader).readString), nil
 }
 
 func (m *Module) LlamaCtxGenerate(ctx uint64, prompt string, promptLen uint32, paramsJson string, paramsJsonLen uint32, sink Token_SinkNode) (string, error) {

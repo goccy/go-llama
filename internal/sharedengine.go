@@ -91,6 +91,8 @@ func mapSharedMemory(img *base.SharedImage, opts Options) ([]byte, error) {
 // first use. The builder runs only the start section (Initialize): instances
 // run WasmInit themselves, with their own WASI.
 func sharedEngineImage() *base.SharedImage {
+	var builder *Module
+	defer retireBuilder(&builder)
 	return base.NewSharedImageInPlace(defaultMemoryCeiling, func(mem []byte) (g *base.Module, err error) {
 		if sharedImagesDisabled() {
 			return nil, fmt.Errorf("disabled by GO_LLAMA_NO_SHARED_IMAGE")
@@ -104,12 +106,24 @@ func sharedEngineImage() *base.SharedImage {
 		// every page it writes IS the image, so building costs exactly the
 		// pages the start section touches — no ceiling-sized allocation, no
 		// copy. See base.NewSharedImageInPlace.
-		m := &Module{}
-		m.g = wasm2go.NewWithMemory(base.DefaultWASI(), envStubs{m: m}, wasmifyStubs{m: m},
-			mem, wasm2go.InitialMemoryBytes)
+		m := newModule()
+		builder = m
+		m.adopt(wasm2go.NewWithMemory(base.DefaultWASI(), envStubs{m: m}, wasmifyStubs{m: m},
+			mem, wasm2go.InitialMemoryBytes))
 		wasm2go.Initialize(m.g)
 		return m.g, nil
 	})
+}
+
+// retireBuilder abandons the engine an image was built on, once the image
+// is sealed: the memory belongs to the image now, and the engine must not
+// stay registered (engineGates would pin it, and its calls must fail).
+// Called through defer, after the image builder has captured the memory
+// and globals it needs from the module.
+func retireBuilder(builder **Module) {
+	if *builder != nil {
+		(*builder).Abandon()
+	}
 }
 
 // --- copy-on-write model snapshot (engines sharing a loaded model) ----------
@@ -155,6 +169,7 @@ func buildModelSnapshot(opts Options, load func(*Module) (uint64, error)) *Model
 		return &ModelSnapshot{err: fmt.Errorf("disabled by GO_LLAMA_NO_SHARED_IMAGE")}
 	}
 	var handle uint64
+	var builder *Module
 	img := base.NewSharedSnapshotInPlace(memoryCeiling(opts), func(mem []byte) (g *base.Module, err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -165,9 +180,10 @@ func buildModelSnapshot(opts Options, load func(*Module) (uint64, error)) *Model
 		// the engine boots and loads the model straight into the image, so
 		// the snapshot costs exactly the pages the build touches — once,
 		// file-backed — instead of a private build plus a ceiling-sized copy.
-		m := &Module{}
-		m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
-			mem, wasm2go.InitialMemoryBytes)
+		m := newModule()
+		builder = m
+		m.adopt(wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+			mem, wasm2go.InitialMemoryBytes))
 		if err := initEngine(m); err != nil {
 			return nil, err
 		}
@@ -181,6 +197,7 @@ func buildModelSnapshot(opts Options, load func(*Module) (uint64, error)) *Model
 		handle = h
 		return m.g, nil
 	})
+	retireBuilder(&builder)
 	if err := img.Err(); err != nil {
 		return &ModelSnapshot{err: err}
 	}
@@ -199,9 +216,9 @@ func NewEngineFromModelSnapshot(snap *ModelSnapshot, opts Options) (*Module, err
 	if err != nil {
 		return nil, err
 	}
-	m := &Module{}
-	m.g = wasm2go.NewFromSnapshot(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
-		mem, snap.img.Size(), snap.img.Globals())
+	m := newModule()
+	m.adopt(wasm2go.NewFromSnapshot(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+		mem, snap.img.Size(), snap.img.Globals()))
 	engineMmaps.Store(m, mem)
 	return m, nil
 }
@@ -218,6 +235,10 @@ type InstanceSnapshot struct {
 	img *base.SharedImage
 }
 
+// ImageSize is the size in bytes of the captured image: what an engine
+// forked from it starts with.
+func (s *InstanceSnapshot) ImageSize() uint64 { return s.img.Size() }
+
 // BuildInstanceSnapshot boots an engine directly on a snapshot image and
 // hands it to build to prepare (load a model, create and prime contexts).
 // The handles build records remain valid in every engine created from the
@@ -227,15 +248,17 @@ func BuildInstanceSnapshot(opts Options, build func(*Module) error) (*InstanceSn
 	if sharedImagesDisabled() {
 		return nil, fmt.Errorf("disabled by GO_LLAMA_NO_SHARED_IMAGE")
 	}
+	var builder *Module
 	img := base.NewSharedSnapshotInPlace(memoryCeiling(opts), func(mem []byte) (g *base.Module, err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				g, err = nil, fmt.Errorf("preparing the engine to snapshot panicked: %v", r)
 			}
 		}()
-		m := &Module{}
-		m.g = wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
-			mem, wasm2go.InitialMemoryBytes)
+		m := newModule()
+		builder = m
+		m.adopt(wasm2go.NewWithMemory(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+			mem, wasm2go.InitialMemoryBytes))
 		if err := initEngine(m); err != nil {
 			return nil, err
 		}
@@ -244,6 +267,7 @@ func BuildInstanceSnapshot(opts Options, build func(*Module) error) (*InstanceSn
 		}
 		return m.g, nil
 	})
+	retireBuilder(&builder)
 	if err := img.Err(); err != nil {
 		return nil, err
 	}
@@ -258,9 +282,9 @@ func NewEngineFromInstanceSnapshot(snap *InstanceSnapshot, opts Options) (*Modul
 	if err != nil {
 		return nil, err
 	}
-	m := &Module{}
-	m.g = wasm2go.NewFromSnapshot(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
-		mem, snap.img.Size(), snap.img.Globals())
+	m := newModule()
+	m.adopt(wasm2go.NewFromSnapshot(engineWASI(opts), envStubs{m: m}, wasmifyStubs{m: m},
+		mem, snap.img.Size(), snap.img.Globals()))
 	engineMmaps.Store(m, mem)
 	return m, nil
 }
