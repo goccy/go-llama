@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"slices"
+
+	bridge "github.com/goccy/go-llama/internal"
 )
 
 // The decoded forms of the JSON documents the wasm bridge returns. The bridge
@@ -279,15 +281,17 @@ type envelope struct {
 
 // err turns a not-ok envelope into an error naming the operation. A result
 // that is neither ok nor carries a message still has to fail: silently
-// returning the zero value would look like success.
+// returning the zero value would look like success. Either way it is the
+// guest declining (a *bridge.GuestError), with its state as the call left
+// it — not a trap, not a closed engine.
 func (e *envelope) err(what string) error {
 	switch {
 	case e.Ok:
 		return nil
 	case e.Error != "":
-		return fmt.Errorf("llama: %s: %s", what, e.Error)
+		return &bridge.GuestError{Err: fmt.Errorf("llama: %s: %s", what, e.Error)}
 	default:
-		return fmt.Errorf("llama: %s: failed without a message", what)
+		return &bridge.GuestError{Err: fmt.Errorf("llama: %s: failed without a message", what)}
 	}
 }
 

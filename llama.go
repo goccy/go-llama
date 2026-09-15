@@ -13,6 +13,7 @@ package llama
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	bridge "github.com/goccy/go-llama/internal"
 	"github.com/goccy/llamawasm2go/base"
@@ -52,6 +54,164 @@ type Llama struct {
 	mu     sync.Mutex // guards the engine swap and models during LoadModel
 	models int        // models loaded into the current engine
 	closed atomic.Bool
+	// closeMu makes every Close wait for the teardown in progress and return
+	// its result. closed is still separate so ordinary calls can fail fast as
+	// soon as teardown starts.
+	closeMu  sync.Mutex
+	closeErr error
+	// wedged is set when a call that manages this instance's guest threads
+	// trapped (a context free, a threadpool attach): whether the workers
+	// were joined is then unknown, and Close keeps the memory mapped rather
+	// than unmap it under threads that may still run in it.
+	wedged atomic.Bool
+	// ctxs are the contexts of this instance (Model.NewContext, or
+	// Snapshot.Fork) that may still be open; ctxMu guards it. Close frees
+	// the ones still open before releasing the memory — the join inside
+	// that free is what stops their threadpool workers. Only the contexts'
+	// guest-side state is held, never the *Context: a Context points back
+	// at this instance, and a reference from here would keep the instance
+	// reachable for as long as itself, so an instance dropped without
+	// Close would never be finalized.
+	// ctxMu guards ctxs, and is held across a context's creation, so a
+	// Close taking the record over either waits for the context and frees
+	// it or has closed the instance first and it is refused.
+	ctxMu sync.Mutex
+	ctxs  []*ctxState
+}
+
+// ctxState is a context's guest-side state, shared between the Context
+// and its instance's record of it (Llama.ctxs), so that whichever of
+// Context.Close and the instance's Close comes first frees the context
+// and the other finds it freed.
+type ctxState struct {
+	h      uint64
+	modelH uint64 // the model the context is over, for Model.Close
+	// interruptAddr is the linear-memory address of the context's interrupt
+	// flag, resolved once at creation so a generation can be stopped
+	// without calling into the engine — which nothing could do while the
+	// generation is inside it.
+	interruptAddr uint64
+	// calls is held shared by every engine call on the context and
+	// exclusively by the free: a Close waits for the calls in flight, and
+	// a call that starts after it finds closed set. Interrupt, which must
+	// reach a running generation, does not take it.
+	calls sync.RWMutex
+	// closed is set before the free is even waited for, so that no call
+	// enters after Close began; freed once the guest-side free has run.
+	closed atomic.Bool
+	freed  atomic.Bool
+	// closeErr is written by the first free and read by later closers while
+	// calls is held exclusively.
+	closeErr error
+	// interruptMu orders Interrupt's write of the interrupt word — which
+	// lives inside the guest's context object — against the free of that
+	// object: Interrupt holds it for the write, the free across the call
+	// that deletes the object and the freed store. It excludes the free,
+	// not the generation, which is what calls cannot give.
+	interruptMu sync.Mutex
+	// slots is the Slots scheduling on the context, at most one at a time;
+	// slotsMu guards it. The free stops it first, so no scheduler step
+	// runs on a freed context.
+	slotsMu sync.Mutex
+	slots   *Slots
+}
+
+// track records st as a context of the instance, dropping the records of
+// contexts freed since. The caller holds ctxMu.
+func (l *Llama) track(st *ctxState) {
+	live := l.ctxs[:0]
+	for _, s := range l.ctxs {
+		if !s.freed.Load() {
+			live = append(live, s)
+		}
+	}
+	l.ctxs = append(live, st)
+}
+
+// takeContexts takes the instance's record of its contexts over for its
+// Close and returns the ones not yet freed. It waits for a context being
+// created, and for a Model.Close in progress.
+func (l *Llama) takeContexts() []*ctxState {
+	l.ctxMu.Lock()
+	defer l.ctxMu.Unlock()
+	var open []*ctxState
+	for _, st := range l.ctxs {
+		if !st.freed.Load() {
+			open = append(open, st)
+		}
+	}
+	l.ctxs = nil
+	return open
+}
+
+// interrupt raises the context's interrupt flag: the generation running
+// on it, if any, returns at its next token. It calls nothing in the
+// engine — it writes one aligned word straight into linear memory, under
+// the lock memory.grow takes, so the memory can neither be resliced nor
+// relocated meanwhile — and under interruptMu, so the guest object the
+// word lives in is not freed meanwhile. A freed context, and a closed
+// engine (no memory), are refused.
+func (l *Llama) interrupt(st *ctxState) error {
+	st.interruptMu.Lock()
+	defer st.interruptMu.Unlock()
+	if st.freed.Load() {
+		return errors.New("llama: interrupt: context is closed")
+	}
+	m := l.e().Base()
+	if m == nil {
+		return fmt.Errorf("llama: interrupt: %w", ErrInstanceClosed)
+	}
+	var err error
+	base.AccessMemory(m, func(mem []byte) {
+		if mem == nil {
+			// A released engine has no memory; Base() still answers.
+			err = fmt.Errorf("llama: interrupt: %w", ErrInstanceClosed)
+			return
+		}
+		addr := int(st.interruptAddr)
+		if addr <= 0 || addr+4 > len(mem) {
+			err = fmt.Errorf("llama: interrupt: address %d is outside linear memory", st.interruptAddr)
+			return
+		}
+		// One aligned word, which the generation loop reads once per token.
+		binary.LittleEndian.PutUint32(mem[addr:], 1)
+	})
+	return err
+}
+
+// freeContext frees a context of the instance: it refuses further calls,
+// interrupts and waits for the one in flight, stops the context's Slots,
+// and frees the guest-side context — which joins its threadpool workers.
+// A second closer waits for the first and finds the context freed.
+func (l *Llama) freeContext(st *ctxState) error {
+	st.closed.Store(true)
+	// A generation in flight returns at its next token rather than run to
+	// its end while Close waits for it. The guest clears the flag when a
+	// generation starts, so a call that entered just before closed was
+	// set and starts its generation after this raised the flag would run
+	// on: raise it again while the wait lasts. (A speculative generation
+	// polls the flags of both its contexts, so this reaches it whichever
+	// of them is being closed.)
+	for !st.calls.TryLock() {
+		_ = l.interrupt(st)
+		time.Sleep(time.Millisecond)
+	}
+	defer st.calls.Unlock()
+	if st.freed.Load() {
+		return st.closeErr
+	}
+	st.slotsMu.Lock()
+	s := st.slots
+	st.slotsMu.Unlock()
+	if s != nil {
+		_ = s.Close()
+	}
+	st.interruptMu.Lock()
+	defer st.interruptMu.Unlock()
+	err := l.noteTrap(l.e().LlamaCtxFree(st.h))
+	st.closeErr = err
+	st.freed.Store(true)
+	return err
 }
 
 // e is the engine accessor every method funnels through.
@@ -123,7 +283,9 @@ func New(opts ...Option) (*Llama, error) {
 	l.eng.Store(eng)
 	// The engine may own a copy-on-write mapping, which is not Go heap: if the
 	// instance is dropped without Close, unmap it when the GC finds it.
-	runtime.SetFinalizer(l, func(l *Llama) { l.Close() })
+	// On its own goroutine: Close joins guest threads, and the finalizer
+	// goroutine is the process's one.
+	runtime.SetFinalizer(l, func(l *Llama) { go l.Close() })
 	return l, nil
 }
 
@@ -164,18 +326,70 @@ func (c *config) bridgeOptions(discardIO bool) bridge.Options {
 }
 
 // Close releases the instance, including the copy-on-write memory mapping when
-// the engine is backed by one. Models and contexts opened from it must be
-// closed first; using any of them afterward fails — the engine's memory is
-// gone.
+// the engine is backed by one. Contexts still open are closed first — a
+// generation running on one is interrupted and waited for, and the free
+// joins the context's threadpool workers, which must not outlive the
+// memory they run in — and their Close errors are returned; models need
+// no Close of their own. Using anything of the instance afterward fails
+// with ErrInstanceClosed.
+//
+// If freeing a context trapped, whether its workers were joined is
+// unknown, and unmapping the memory under threads that may still run in
+// it would crash the process: Close then leaves the memory mapped for the
+// life of the process and reports ErrMemoryLeaked. The instance is closed
+// either way.
 func (l *Llama) Close() error {
-	if l.closed.Swap(true) {
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
+	if l.closed.Load() {
+		return l.closeErr
+	}
+	l.closed.Store(true)
+	runtime.SetFinalizer(l, nil)
+	// Under l.mu: a LoadModel in flight may be about to swap the engine,
+	// and must find the instance closed under the same lock (or have
+	// swapped already, so that the engine released here is the new one).
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	eng := l.e()
+	if eng == nil {
 		return nil
 	}
-	runtime.SetFinalizer(l, nil)
-	if eng := l.e(); eng != nil {
-		eng.Close()
+	var errs []error
+	for _, st := range l.takeContexts() {
+		if err := l.freeContext(st); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	if l.wedged.Load() {
+		eng.Abandon()
+		errs = append(errs, ErrMemoryLeaked)
+	} else if err := eng.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("%w: %w", ErrMemoryLeaked, err))
+	}
+	l.closeErr = errors.Join(errs...)
+	return l.closeErr
+}
+
+// ErrMemoryLeaked is returned by Close when the instance's memory was
+// deliberately kept mapped, because a trap left it unknown whether the
+// instance's worker threads had been joined (see Llama.Close).
+var ErrMemoryLeaked = errors.New("llama: close: memory kept mapped, worker threads may still run in it")
+
+// ErrInstanceClosed is in the error of every call on a closed instance,
+// and of a Slots task the instance's Close ended.
+var ErrInstanceClosed = bridge.ErrEngineClosed
+
+// noteTrap records on the instance that a thread-managing call trapped,
+// and passes err through. Only a *bridge.TrapError counts: a bridge error
+// object means the guest declined the call cleanly, with its threads
+// where they were.
+func (l *Llama) noteTrap(err error) error {
+	var trap *bridge.TrapError
+	if errors.As(err, &trap) && !trap.Refused {
+		l.wedged.Store(true)
+	}
+	return err
 }
 
 func (l *Llama) lastError() string {
@@ -250,6 +464,12 @@ type Model struct {
 	inst   *Llama
 	h      uint64
 	closed atomic.Bool
+	// calls keeps model-only operations from running through the raw model
+	// handle while Close frees it. Context operations have their own gate and
+	// Close frees every context before the model.
+	calls    sync.RWMutex
+	closeMu  sync.Mutex
+	closeErr error
 }
 
 // Context is one inference context over a Model: its own KV cache and its own
@@ -259,12 +479,8 @@ type Context struct {
 	model *Model
 	h     uint64
 
-	// interruptAddr is the linear-memory address of this context's interrupt
-	// flag, resolved once at creation so Interrupt never has to call into the
-	// engine — which it could not do while a generation is inside it.
-	interruptAddr uint64
-
-	closed atomic.Bool
+	// st is shared with the instance's record of the context (Llama.ctxs).
+	st *ctxState
 }
 
 // LoadModel loads a GGUF model from path into this instance.
@@ -275,7 +491,7 @@ type Context struct {
 // that root.
 func (l *Llama) LoadModel(path string) (*Model, error) {
 	if l.closed.Load() {
-		return nil, errors.New("llama: instance is closed")
+		return nil, fmt.Errorf("llama: load model: %w", ErrInstanceClosed)
 	}
 	guestPath := path
 	if l.cfg.fs == nil && l.cfg.preopenDir == "" {
@@ -287,6 +503,9 @@ func (l *Llama) LoadModel(path string) (*Model, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed.Load() {
+		return nil, fmt.Errorf("llama: load model: %w", ErrInstanceClosed)
+	}
 
 	// Shared fast path: when this is the instance's first model and the
 	// filesystem configuration is keyable (a host directory, not an arbitrary
@@ -325,7 +544,7 @@ func (l *Llama) LoadModel(path string) (*Model, error) {
 // BuildInfo reports how the embedded engine was compiled.
 func (l *Llama) BuildInfo() (Build, error) {
 	if l.closed.Load() {
-		return Build{}, errors.New("llama: instance is closed")
+		return Build{}, fmt.Errorf("llama: build info: %w", ErrInstanceClosed)
 	}
 	js, err := l.e().LlamaWasmBuildInfo()
 	if err != nil {
@@ -345,28 +564,85 @@ func (l *Llama) BuildInfo() (Build, error) {
 // pointer, so calling on through it after Close would be a use-after-free
 // inside the engine rather than a Go error.
 func (m *Model) use(what string) error {
+	// The instance first: once it is closed, everything of it is, and
+	// ErrInstanceClosed is the answer whatever else was closed before.
+	if m.inst.closed.Load() {
+		return fmt.Errorf("llama: %s: %w", what, ErrInstanceClosed)
+	}
 	if m.closed.Load() {
 		return fmt.Errorf("llama: %s: model is closed", what)
-	}
-	if m.inst.closed.Load() {
-		return fmt.Errorf("llama: %s: instance is closed", what)
 	}
 	return nil
 }
 
-// Close frees the model. Contexts created from it must be closed first.
+// enter holds the model open for an operation that uses its guest handle.
+// The returned release must be called after the engine call returns.
+func (m *Model) enter(what string) (release func(), err error) {
+	if err := m.use(what); err != nil {
+		return nil, err
+	}
+	m.calls.RLock()
+	if err := m.use(what); err != nil {
+		m.calls.RUnlock()
+		return nil, err
+	}
+	return m.calls.RUnlock, nil
+}
+
+// Close frees the model, closing its contexts still open first: a context
+// must not outlive its model. Their Close errors are returned. Nothing to
+// do once the instance's Close has begun: that frees every context and
+// then the memory the model is in.
 func (m *Model) Close() error {
-	if m.closed.Swap(true) {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	if m.closed.Load() {
+		return m.closeErr
+	}
+	m.closed.Store(true)
+	m.calls.Lock()
+	defer m.calls.Unlock()
+	// The closed check and the look-up of the model's contexts are one
+	// step under the instance's exclusive lock: an instance Close either
+	// went first — and this is a no-op — or takes the contexts over
+	// afterwards and finds them freed, or being freed, by this. The frees
+	// themselves wait outside the lock, so contexts of other models are
+	// not held up meanwhile.
+	l := m.inst
+	l.ctxMu.Lock()
+	if l.closed.Load() {
+		l.ctxMu.Unlock()
 		return nil
 	}
-	return m.inst.e().LlamaModelFree(m.h)
+	var ctxs []*ctxState
+	for _, st := range l.ctxs {
+		if !st.freed.Load() && st.modelH == m.h {
+			ctxs = append(ctxs, st)
+		}
+	}
+	l.ctxMu.Unlock()
+	var errs []error
+	for _, st := range ctxs {
+		if err := l.freeContext(st); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	// An instance Close that began meanwhile has released the engine (or
+	// will): its memory goes with the model, and this is then a no-op.
+	if err := l.e().LlamaModelFree(m.h); err != nil && !errors.Is(err, ErrInstanceClosed) {
+		errs = append(errs, err)
+	}
+	m.closeErr = errors.Join(errs...)
+	return m.closeErr
 }
 
 // Info returns the model's metadata.
 func (m *Model) Info() (ModelInfo, error) {
-	if err := m.use("model info"); err != nil {
+	release, err := m.enter("model info")
+	if err != nil {
 		return ModelInfo{}, err
 	}
+	defer release()
 	js, err := m.inst.e().LlamaModelInfo(m.h)
 	if err != nil {
 		return ModelInfo{}, err
@@ -385,9 +661,11 @@ func (m *Model) Info() (ModelInfo, error) {
 // convention; parseSpecial lets special-token text ("<|im_start|>") tokenize
 // as that token rather than as its characters.
 func (m *Model) Tokenize(text string, addSpecial, parseSpecial bool) ([]int32, error) {
-	if err := m.use("tokenize"); err != nil {
+	release, err := m.enter("tokenize")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	js, err := m.inst.e().LlamaTokenize(m.h, text, uint32(len(text)), b2i(addSpecial), b2i(parseSpecial))
 	if err != nil {
 		return nil, err
@@ -404,9 +682,11 @@ func (m *Model) Tokenize(text string, addSpecial, parseSpecial bool) ([]int32, e
 
 // Detokenize renders tokens back to text.
 func (m *Model) Detokenize(tokens []int32, renderSpecial bool) (string, error) {
-	if err := m.use("detokenize"); err != nil {
+	release, err := m.enter("detokenize")
+	if err != nil {
 		return "", err
 	}
+	defer release()
 	raw, err := json.Marshal(tokens)
 	if err != nil {
 		return "", err
@@ -421,9 +701,11 @@ func (m *Model) Detokenize(tokens []int32, renderSpecial bool) (string, error) {
 // TokenToPiece renders one token. A byte-level token can render to invalid
 // UTF-8 on its own; accumulate pieces before treating the result as text.
 func (m *Model) TokenToPiece(token int32, renderSpecial bool) (string, error) {
-	if err := m.use("token_to_piece"); err != nil {
+	release, err := m.enter("token_to_piece")
+	if err != nil {
 		return "", err
 	}
+	defer release()
 	js, err := m.inst.e().LlamaTokenToPiece(m.h, token, b2i(renderSpecial))
 	if err != nil {
 		return "", err
@@ -435,9 +717,11 @@ func (m *Model) TokenToPiece(token int32, renderSpecial bool) (string, error) {
 // template. templateOverride replaces it, and is required when the GGUF
 // carries none; addAssistant appends the generation prefix.
 func (m *Model) ApplyChatTemplate(messages []Message, templateOverride string, addAssistant bool) (string, error) {
-	if err := m.use("chat template"); err != nil {
+	release, err := m.enter("chat template")
+	if err != nil {
 		return "", err
 	}
+	defer release()
 	raw, err := json.Marshal(messages)
 	if err != nil {
 		return "", err
@@ -468,9 +752,11 @@ type LoRA struct {
 // LoadLoRA loads a LoRA adapter GGUF for this model. path resolves like
 // LoadModel's.
 func (m *Model) LoadLoRA(path string) (*LoRA, error) {
-	if err := m.use("load lora"); err != nil {
+	release, err := m.enter("load lora")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	guestPath := path
 	if m.inst.cfg.fs == nil && m.inst.cfg.preopenDir == "" {
 		abs, err := filepath.Abs(path)
@@ -507,9 +793,11 @@ type LoRAWeight struct {
 // semantics of llama.cpp's own API. An empty (or nil) slice removes every
 // adapter, so SetLoRA(nil) is the spelling of "clear".
 func (c *Context) SetLoRA(adapters []LoRAWeight) error {
-	if err := c.use("set lora"); err != nil {
+	release, err := c.enter("set lora")
+	if err != nil {
 		return err
 	}
+	defer release()
 	pairs := make([][2]float64, len(adapters))
 	for i, a := range adapters {
 		if a.Adapter == nil || a.Adapter.closed.Load() {
@@ -531,9 +819,11 @@ func (c *Context) SetLoRA(adapters []LoRAWeight) error {
 
 // NewContext creates an inference context over the model.
 func (m *Model) NewContext(p ContextParams) (*Context, error) {
-	if err := m.use("new context"); err != nil {
+	release, err := m.enter("new context")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	raw, err := json.Marshal(ctxRequest{
 		NCtx:          p.NCtx,
 		NBatch:        p.NBatch,
@@ -548,19 +838,31 @@ func (m *Model) NewContext(p ContextParams) (*Context, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Created and recorded under the instance's lock, so a Close running
+	// meanwhile either waits and then frees this context with the others,
+	// or has closed the instance already and is refused here.
+	m.inst.ctxMu.Lock()
+	defer m.inst.ctxMu.Unlock()
+	if err := m.use("new context"); err != nil {
+		return nil, err
+	}
 	h, err := m.inst.e().LlamaCtxNew(m.h, string(raw), uint32(len(raw)))
 	if err != nil {
-		return nil, err
+		// The guest creates the context's pool before the context object:
+		// a trap in between leaves workers nothing records (noteTrap keeps
+		// the memory mapped for them at Close).
+		return nil, m.inst.noteTrap(err)
 	}
 	if h == 0 {
 		return nil, fmt.Errorf("llama: new context: %s", m.inst.lastError())
 	}
-	c := &Context{model: m, h: h}
-	if c.interruptAddr, err = m.inst.e().LlamaCtxInterruptAddr(h); err != nil {
-		return nil, err
+	c := &Context{model: m, h: h, st: &ctxState{h: h, modelH: m.h}}
+	m.inst.track(c.st)
+	if c.st.interruptAddr, err = m.inst.e().LlamaCtxInterruptAddr(h); err != nil {
+		return nil, errors.Join(err, c.Close())
 	}
-	if c.interruptAddr == 0 {
-		return nil, errors.New("llama: new context: engine reported no interrupt address")
+	if c.st.interruptAddr == 0 {
+		return nil, errors.Join(errors.New("llama: new context: engine reported no interrupt address"), c.Close())
 	}
 	return c, nil
 }
@@ -568,18 +870,42 @@ func (m *Model) NewContext(p ContextParams) (*Context, error) {
 // use reports whether the context is still usable, and that its model is
 // too: a context outliving its model holds a dangling llama_context.
 func (c *Context) use(what string) error {
-	if c.closed.Load() {
+	if err := c.model.use(what); err != nil {
+		return err
+	}
+	if c.st.closed.Load() {
 		return fmt.Errorf("llama: %s: context is closed", what)
 	}
-	return c.model.use(what)
+	return nil
 }
 
-// Close frees the context. The Model outlives it.
-func (c *Context) Close() error {
-	if c.closed.Swap(true) {
-		return nil
+// enter is use for a call into the engine on this context: it also holds
+// the context open for the call's duration, so a Close waits for it
+// instead of freeing the context under it. The returned release must be
+// called when the call has returned.
+func (c *Context) enter(what string) (release func(), err error) {
+	// The check before the lock is the fast answer: a Close holds the
+	// lock across its whole teardown, and a call arriving meanwhile need
+	// not wait for that to be told the context is closed. The check
+	// after it is the one that counts.
+	if err := c.use(what); err != nil {
+		return nil, err
 	}
-	return c.model.inst.e().LlamaCtxFree(c.h)
+	c.st.calls.RLock()
+	if err := c.use(what); err != nil {
+		c.st.calls.RUnlock()
+		return nil, err
+	}
+	return c.st.calls.RUnlock, nil
+}
+
+// Close frees the context, stopping and joining its threadpool workers. A
+// generation in flight on the context is interrupted (it returns at its
+// next token, with StopInterrupted) and any other call waited for. A
+// Slots still scheduling on the context is closed too; its tasks end with
+// ErrSlotsClosed. The Model outlives it.
+func (c *Context) Close() error {
+	return c.model.inst.freeContext(c.st)
 }
 
 // Generate runs generation from prompt and returns the whole result.
@@ -597,15 +923,35 @@ func (c *Context) Generate(prompt string, p Params) (Result, error) {
 // Both contexts' KV caches restart from the prompt. Result.NDrafted and
 // Result.NAccepted report how well the draft anticipated the target.
 func (c *Context) GenerateWithDraft(draft *Context, prompt string, p Params, nDraft int) (Result, error) {
-	if err := c.use("generate"); err != nil {
-		return Result{}, err
-	}
 	if draft == nil {
 		return Result{}, errors.New("llama: generate with draft: nil draft context")
 	}
-	if err := draft.use("generate (draft)"); err != nil {
+	if draft.model.inst != c.model.inst {
+		// A handle means nothing in another instance's memory.
+		return Result{}, errors.New("llama: generate with draft: the draft must be a context of the same instance")
+	}
+	if draft.st == c.st {
+		// The engine refuses this too, but only after both contexts are
+		// held — and holding the same one twice deadlocks against a Close.
+		return Result{}, errors.New("llama: generate with draft: the draft must be a different context")
+	}
+	// Both contexts are held for the call, in one order whichever is the
+	// draft, so two such calls with the roles swapped cannot each wait
+	// for the other's context behind a Close.
+	first, second := c, draft
+	if second.h < first.h {
+		first, second = second, first
+	}
+	releaseFirst, err := first.enter("generate")
+	if err != nil {
 		return Result{}, err
 	}
+	defer releaseFirst()
+	releaseSecond, err := second.enter("generate")
+	if err != nil {
+		return Result{}, err
+	}
+	defer releaseSecond()
 	raw, err := json.Marshal(p.wire())
 	if err != nil {
 		return Result{}, err
@@ -635,18 +981,22 @@ func (c *Context) GenerateWithDraft(draft *Context, prompt string, p Params, nDr
 
 // Reset drops the KV cache so the next generation starts from nothing.
 func (c *Context) Reset() error {
-	if err := c.use("reset"); err != nil {
+	release, err := c.enter("reset")
+	if err != nil {
 		return err
 	}
+	defer release()
 	return c.model.inst.e().LlamaCtxReset(c.h)
 }
 
 // Embed returns the embedding of text. The context must have been created with
 // ContextParams.Embeddings set. normalize applies L2 normalisation.
 func (c *Context) Embed(text string, normalize bool) ([]float32, error) {
-	if err := c.use("embed"); err != nil {
+	release, err := c.enter("embed")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	js, err := c.model.inst.e().LlamaCtxEmbed(c.h, text, uint32(len(text)), b2i(normalize))
 	if err != nil {
 		return nil, err
@@ -673,9 +1023,11 @@ type EvalResult struct {
 // evaluation. Positions continue from the cache's current end; Reset
 // starts over. addSpecial and parseSpecial mirror Tokenize.
 func (c *Context) Eval(text string, addSpecial, parseSpecial bool) (EvalResult, error) {
-	if err := c.use("eval"); err != nil {
+	release, err := c.enter("eval")
+	if err != nil {
 		return EvalResult{}, err
 	}
+	defer release()
 	js, err := c.model.inst.e().LlamaCtxEval(c.h, text, uint32(len(text)), b2i(addSpecial), b2i(parseSpecial))
 	if err != nil {
 		return EvalResult{}, err
@@ -692,9 +1044,11 @@ func (c *Context) Eval(text string, addSpecial, parseSpecial bool) (EvalResult, 
 
 // EmbedTokens is Embed from token ids instead of text.
 func (c *Context) EmbedTokens(tokens []int32, normalize bool) ([]float32, error) {
-	if err := c.use("embed tokens"); err != nil {
+	release, err := c.enter("embed tokens")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	raw, err := json.Marshal(tokens)
 	if err != nil {
 		return nil, err
@@ -720,9 +1074,11 @@ func (c *Context) EmbedTokens(tokens []int32, normalize bool) ([]float32, error)
 // positionally (Eval-prefill style) or generate with Params.CachePrompt,
 // which picks up the saved prefix immediately.
 func (c *Context) SaveState() ([]byte, error) {
-	if err := c.use("save state"); err != nil {
+	release, err := c.enter("save state")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	js, err := c.model.inst.e().LlamaCtxStateSave(c.h)
 	if err != nil {
 		return nil, err
@@ -761,9 +1117,11 @@ func (c *Context) SaveState() ([]byte, error) {
 // over the same model with compatible parameters, or the engine rejects
 // the payload.
 func (c *Context) LoadState(state []byte) error {
-	if err := c.use("load state"); err != nil {
+	release, err := c.enter("load state")
+	if err != nil {
 		return err
 	}
+	defer release()
 	js, err := c.model.inst.e().LlamaCtxStateLoad(c.h, string(state), uint32(len(state)))
 	if err != nil {
 		return err
@@ -786,9 +1144,11 @@ type ScoreResult struct {
 // model, the quantity llama.cpp's perplexity tool averages. It decodes text
 // into the context's KV cache; call Reset before generating afterwards.
 func (c *Context) Score(text string) (ScoreResult, error) {
-	if err := c.use("score"); err != nil {
+	release, err := c.enter("score")
+	if err != nil {
 		return ScoreResult{}, err
 	}
+	defer release()
 	js, err := c.model.inst.e().LlamaCtxScore(c.h, text, uint32(len(text)))
 	if err != nil {
 		return ScoreResult{}, err
@@ -814,9 +1174,11 @@ func (c *Context) Score(text string) (ScoreResult, error) {
 // non-empty and must not contain newlines (the wire format separates them
 // with '\n').
 func (c *Context) ScoreChoices(choices []string) ([]ScoreResult, error) {
-	if err := c.use("score choices"); err != nil {
+	release, err := c.enter("score choices")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	for _, ch := range choices {
 		if ch == "" || strings.ContainsRune(ch, '\n') {
 			return nil, errors.New("llama: score choices: choices must be non-empty and newline-free")
@@ -843,9 +1205,11 @@ func (c *Context) ScoreChoices(choices []string) ([]ScoreResult, error) {
 // generate is the one path into the engine's generation loop. sink is nil for
 // a plain Generate and the caller's piece sink for Stream.
 func (c *Context) generate(prompt string, req genRequest, sink bridge.Token_SinkNode) (Result, error) {
-	if err := c.use("generate"); err != nil {
+	release, err := c.enter("generate")
+	if err != nil {
 		return Result{}, err
 	}
+	defer release()
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return Result{}, err
@@ -932,3 +1296,6 @@ func (t textFields) bytes(what string) (string, error) {
 	}
 	return string(raw), nil
 }
+
+// Model returns the model the context is over.
+func (c *Context) Model() *Model { return c.model }

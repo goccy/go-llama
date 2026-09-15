@@ -1,11 +1,48 @@
 package llama_test
 
 import (
+	"os"
 	"strings"
 	"testing"
 
 	llama "github.com/goccy/go-llama"
 )
+
+// buildTestSnapshot prepares a snapshot of the test model with one kept
+// context, "main": 512 cells, two threads, primed with prefix so a fork's
+// CachePrompt generate of prefix+suffix decodes only the suffix. Requires
+// the test model (skips without it).
+func buildTestSnapshot(t *testing.T, prefix string) *llama.Snapshot {
+	t.Helper()
+	return buildTestSnapshotWith(t, prefix)
+}
+
+// buildTestSnapshotWith is buildTestSnapshot with options for the snapshot
+// (and so for every fork of it).
+func buildTestSnapshotWith(t *testing.T, prefix string, opts ...llama.Option) *llama.Snapshot {
+	t.Helper()
+	if _, err := os.Stat(modelPath()); err != nil {
+		t.Skipf("test model missing (%v); run `make testdata` or set GO_LLAMA_TEST_MODEL", err)
+	}
+	snap, err := llama.NewSnapshot(func(b *llama.SnapshotBuilder) error {
+		m, err := b.LoadModel(modelPath())
+		if err != nil {
+			return err
+		}
+		c, err := m.NewContext(llama.ContextParams{NCtx: 512, NThreads: 2})
+		if err != nil {
+			return err
+		}
+		if _, err := c.Generate(prefix, llama.Params{NPredict: 1, CachePrompt: true, Temperature: 0}); err != nil {
+			return err
+		}
+		return b.Register("main", c)
+	}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
 
 // TestSnapshotFork checks the prepare-once / fork-per-request path: a fork
 // starts with the builder's context — prefix cached, no re-decode — and
@@ -27,23 +64,7 @@ func TestSnapshotFork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap, err := llama.NewSnapshot(func(b *llama.SnapshotBuilder) error {
-		m, err := b.LoadModel(modelPath())
-		if err != nil {
-			return err
-		}
-		c, err := m.NewContext(llama.ContextParams{NCtx: 512, NThreads: 2})
-		if err != nil {
-			return err
-		}
-		if _, err := c.Generate(prefix, llama.Params{NPredict: 1, CachePrompt: true, Temperature: 0}); err != nil {
-			return err
-		}
-		return b.Register("main", c)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	snap := buildTestSnapshot(t, prefix)
 
 	for _, nThreads := range []uint32{2, 1} {
 		f, err := snap.Fork(nThreads)

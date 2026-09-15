@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"iter"
 	"sync"
+
+	bridge "github.com/goccy/go-llama/internal"
 )
 
 // Task is what a Slots runs: a prompt with its sampling parameters. It is a
@@ -72,15 +74,31 @@ type Slots struct {
 
 	wake chan struct{} // nudged by Post: there is something to schedule
 	stop chan struct{} // closed by Close
-	done chan struct{} // closed when the scheduler has returned
+	// done is closed when the scheduler has returned, which it does only
+	// once the Slots is finished with the context: every task ended, the
+	// context's record of it cleared.
+	done chan struct{}
 }
+
+// ErrSlotsRunning is returned by Context.Slots while an earlier Slots of
+// the context is still open.
+var ErrSlotsRunning = errors.New("llama: slots: the context already has a scheduler; close it first")
 
 // Slots starts a scheduler over the context's slots. The context must have
 // been created with NSeqMax set to the number of slots wanted (1 still
-// works: tasks then run one at a time, each on its own sequence).
+// works: tasks then run one at a time, each on its own sequence). A
+// context runs one Slots at a time: a second call while the first is open
+// returns ErrSlotsRunning. Closing the context closes its Slots.
 func (c *Context) Slots() (*Slots, error) {
-	if err := c.use("slots"); err != nil {
+	release, err := c.enter("slots")
+	if err != nil {
 		return nil, err
+	}
+	defer release()
+	c.st.slotsMu.Lock()
+	defer c.st.slotsMu.Unlock()
+	if c.st.slots != nil {
+		return nil, ErrSlotsRunning
 	}
 	s := &Slots{
 		c:     c,
@@ -89,6 +107,7 @@ func (c *Context) Slots() (*Slots, error) {
 		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
+	c.st.slots = s
 	go s.loop()
 	return s, nil
 }
@@ -97,9 +116,11 @@ func (c *Context) Slots() (*Slots, error) {
 // ctx is done: its slot is released, and its completion finishes with the
 // text produced so far, StopInterrupted, and ctx.Err() as the error.
 func (s *Slots) Post(ctx context.Context, task Task) (*TaskCompletion, error) {
-	if err := s.c.use("slots post"); err != nil {
+	release, err := s.c.enter("slots post")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if task.Params.CachePrompt {
 		return nil, errors.New("llama: slots post: CachePrompt is not available to a task")
 	}
@@ -153,9 +174,11 @@ func (s *Slots) Post(ctx context.Context, task Task) (*TaskCompletion, error) {
 // tokenizes differently at the boundary simply decodes in full. Refused
 // while tasks are held; an empty text clears it.
 func (s *Slots) SetSystemPrompt(text string) error {
-	if err := s.c.use("slots system prompt"); err != nil {
+	release, err := s.c.enter("slots system prompt")
+	if err != nil {
 		return err
 	}
+	defer release()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -174,9 +197,11 @@ func (s *Slots) SetSystemPrompt(text string) error {
 
 // Status reports the slots, the tasks and the cache cells in use.
 func (s *Slots) Status() (SlotsStatus, error) {
-	if err := s.c.use("slots status"); err != nil {
+	release, err := s.c.enter("slots status")
+	if err != nil {
 		return SlotsStatus{}, err
 	}
+	defer release()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	js, err := s.c.model.inst.e().LlamaCtxSlotsStatus(s.c.h)
@@ -194,7 +219,9 @@ func (s *Slots) Status() (SlotsStatus, error) {
 }
 
 // Close cancels every task (their completions finish with ErrSlotsClosed)
-// and stops the scheduler. It returns once the scheduler has returned.
+// and stops the scheduler. It returns once the scheduler has returned,
+// which is after every task has ended; a concurrent second Close returns
+// then too.
 func (s *Slots) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -203,17 +230,19 @@ func (s *Slots) Close() error {
 		return nil
 	}
 	s.closed = true
-	pending := make([]*TaskCompletion, 0, len(s.tasks))
-	for _, t := range s.tasks {
-		pending = append(pending, t)
-	}
 	s.mu.Unlock()
 	close(s.stop)
 	<-s.done
-	for _, t := range pending {
-		s.cancel(t, ErrSlotsClosed)
-	}
 	return nil
+}
+
+// detach forgets the Slots on its context, so a new one can be started.
+func (s *Slots) detach() {
+	s.c.st.slotsMu.Lock()
+	if s.c.st.slots == s {
+		s.c.st.slots = nil
+	}
+	s.c.st.slotsMu.Unlock()
 }
 
 func (s *Slots) nudge() {
@@ -224,23 +253,41 @@ func (s *Slots) nudge() {
 }
 
 // loop is the scheduler: one update per iteration while tasks are held,
-// asleep otherwise.
+// asleep otherwise. It owns the Slots' end, whichever way it comes: Close
+// (the tasks are cancelled, with ErrSlotsClosed), or the engine gone
+// under it — closed, or trapped, after which the guest's slots are in no
+// state to step again (the tasks are failed with that error; there is
+// nothing left to schedule on, and a Slots parked for a Close that may
+// never come would hold the instance). Either way it clears the
+// context's record of the Slots and then closes done.
 func (s *Slots) loop() {
 	defer close(s.done)
+	defer s.detach()
 	for {
 		select {
 		case <-s.stop:
+			s.cancelAll(ErrSlotsClosed)
 			return
 		case <-s.wake:
 		}
 		for {
 			select {
 			case <-s.stop:
+				s.cancelAll(ErrSlotsClosed)
 				return
 			default:
 			}
 			busy, err := s.update()
 			if err != nil {
+				if engineGone(err) {
+					// Closed first, so no Post lands between the tasks
+					// being failed and the Slots being over.
+					s.mu.Lock()
+					s.closed = true
+					s.mu.Unlock()
+					s.fail(err)
+					return
+				}
 				s.fail(err)
 				break
 			}
@@ -248,6 +295,19 @@ func (s *Slots) loop() {
 				break
 			}
 		}
+	}
+}
+
+// cancelAll cancels every held task with err.
+func (s *Slots) cancelAll(err error) {
+	s.mu.Lock()
+	pending := make([]*TaskCompletion, 0, len(s.tasks))
+	for _, t := range s.tasks {
+		pending = append(pending, t)
+	}
+	s.mu.Unlock()
+	for _, t := range pending {
+		s.cancel(t, err)
 	}
 }
 
@@ -337,8 +397,16 @@ func (s *Slots) cancel(t *TaskCompletion, err error) {
 	js, cerr := s.c.model.inst.e().LlamaCtxSlotsCancel(s.c.h, int32(t.id))
 	s.mu.Unlock()
 	if cerr != nil {
-		// The task is no longer known to the engine: it finished in an
-		// update racing this cancel, and that update's final wins.
+		if !engineGone(cerr) {
+			// The engine declined: the task is no longer known to it,
+			// having finished in an update racing this cancel, and that
+			// update's final wins.
+			return
+		}
+		// The engine itself is gone (closed, or trapped): nothing will
+		// finish the task now but this. The caller's reason stays the
+		// error, with the engine's attached.
+		s.finish(t, Result{}, errors.Join(err, cerr))
 		return
 	}
 	var out struct {
@@ -357,6 +425,14 @@ func (s *Slots) cancel(t *TaskCompletion, err error) {
 		}
 	}
 	s.finish(t, res, err)
+}
+
+// engineGone reports whether err says the engine can take no further
+// call on the context: it is closed, or it trapped. Anything else — the
+// guest's own error object, a malformed reply — leaves it running.
+func engineGone(err error) bool {
+	var trap *bridge.TrapError
+	return errors.Is(err, ErrInstanceClosed) || errors.As(err, &trap)
 }
 
 // fail ends every held task with err when an update itself failed.
