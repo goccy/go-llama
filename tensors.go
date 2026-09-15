@@ -24,9 +24,11 @@ func (t TensorInfo) Repacked() bool { return t.Buffer == "CPU_REPACK" }
 // Tensors lists the model's weight tensors with the buffer each landed in,
 // which decides the kernel path (repacked GEMV/GEMM versus per-row dot).
 func (m *Model) Tensors() ([]TensorInfo, error) {
-	if err := m.use("model tensors"); err != nil {
+	release, err := m.enter("model tensors")
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	js, err := m.inst.e().LlamaModelTensors(m.h)
 	if err != nil {
 		return nil, err

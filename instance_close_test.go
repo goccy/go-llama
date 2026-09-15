@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -121,6 +122,65 @@ func TestCloseWaitsForCallInFlight(t *testing.T) {
 	}
 }
 
+// TestConcurrentCloseWaitsForTeardown verifies that a second instance or
+// model Close has the same completion semantics as the first: it does not
+// return while the first closer is still waiting for an in-flight call.
+func TestConcurrentCloseWaitsForTeardown(t *testing.T) {
+	for _, target := range []string{"instance", "model"} {
+		t.Run(target, func(t *testing.T) {
+			inst, c := newTestInstance(t, 2, llama.ContextParams{NCtx: 512})
+			closer := inst.Close
+			if target == "model" {
+				defer inst.Close()
+				closer = c.Model().Close
+			}
+			started := make(chan struct{})
+			resume := make(chan struct{})
+			resumeOpen := true
+			defer func() {
+				if resumeOpen {
+					close(resume)
+				}
+			}()
+			var once sync.Once
+			generated := make(chan error, 1)
+			go func() {
+				_, err := c.Stream("Once upon a time", llama.Params{NPredict: 32}, func(string) {
+					once.Do(func() {
+						close(started)
+						<-resume
+					})
+				})
+				generated <- err
+			}()
+			<-started
+
+			closed1 := make(chan error, 1)
+			closed2 := make(chan error, 1)
+			go func() { closed1 <- closer() }()
+			go func() { closed2 <- closer() }()
+			for i, ch := range []<-chan error{closed1, closed2} {
+				select {
+				case <-ch:
+					t.Fatalf("Close %d returned while teardown was waiting for generation", i+1)
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			close(resume)
+			resumeOpen = false
+			if err := <-generated; err != nil {
+				t.Fatalf("generation: %v", err)
+			}
+			if err := <-closed1; err != nil {
+				t.Fatalf("first Close: %v", err)
+			}
+			if err := <-closed2; err != nil {
+				t.Fatalf("second Close: %v", err)
+			}
+		})
+	}
+}
+
 // TestModelCloseFreesOpenContexts: closing a model closes its open
 // contexts first (a context must not outlive its model), joining their
 // workers; calls on them fail afterwards, and the instance's Close finds
@@ -180,5 +240,55 @@ func TestDraftCloseInterruptsSpeculativeGeneration(t *testing.T) {
 	}
 	if _, err := target.Generate("x", llama.Params{NPredict: 1}); err != nil {
 		t.Fatalf("target after the draft closed: %v", err)
+	}
+}
+
+// TestInterruptStopsSpeculativePrefillWithoutToken pins interruption between
+// prompt chunks: once prefill observes the flag, speculative generation must
+// not sample a token from the partial prompt.
+func TestInterruptStopsSpeculativePrefillWithoutToken(t *testing.T) {
+	inst, target := newTestInstance(t, 1, llama.ContextParams{NCtx: 1024, NBatch: 64})
+	defer inst.Close()
+	draft, err := target.Model().NewContext(llama.ContextParams{NCtx: 1024, NBatch: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer draft.Close()
+
+	type outcome struct {
+		res llama.Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	prompt := strings.Repeat("Once upon a time in a land far away, ", 40)
+	go func() {
+		res, err := target.GenerateWithDraft(draft, prompt, llama.Params{NPredict: 8}, 4)
+		done <- outcome{res: res, err: err}
+	}()
+
+	ticker := time.NewTicker(100 * time.Microsecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case out := <-done:
+			if out.err != nil {
+				t.Fatalf("speculative generation: %v", out.err)
+			}
+			if out.res.Reason != llama.StopInterrupted || !out.res.Interrupted {
+				t.Fatalf("generation stopped for %v (interrupted=%v), want StopInterrupted", out.res.Reason, out.res.Interrupted)
+			}
+			if out.res.NDecoded != 0 || len(out.res.Tokens) != 0 || out.res.Text != "" {
+				t.Fatalf("interrupted prefill produced %d tokens and text %q", out.res.NDecoded, out.res.Text)
+			}
+			return
+		case <-ticker.C:
+			if err := target.Interrupt(); err != nil {
+				t.Fatalf("interrupt: %v", err)
+			}
+		case <-deadline.C:
+			t.Fatal("speculative prefill did not stop")
+		}
 	}
 }

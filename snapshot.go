@@ -123,6 +123,7 @@ func NewSnapshot(build func(*SnapshotBuilder) error, opts ...Option) (*Snapshot,
 			// under them. Seal the image instead: its mapping then stays
 			// as long as those workers hold the engine, which is for good.
 			// Nothing forks it.
+			m.PreserveMemoryOnAbandon()
 			wedged = errors.Join(buildErr, ErrMemoryLeaked)
 			return nil
 		}

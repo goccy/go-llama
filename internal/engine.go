@@ -222,6 +222,9 @@ type engineGate struct {
 	// blocks, half-built state — stays as it was, so the engine is only
 	// good for tearing down afterwards.
 	trapped atomic.Pointer[TrapError]
+	// preserveMemory suppresses an in-place image builder's finalizer when
+	// workers may still reference that mapping.
+	preserveMemory atomic.Bool
 }
 
 // newModule is the constructor every engine goes through: it registers
@@ -323,6 +326,16 @@ func (m *Module) Close() error { return m.release(true) }
 // then on.
 func (m *Module) Abandon() { _ = m.release(false) }
 
+// PreserveMemoryOnAbandon keeps an in-place image builder's mapping alive
+// after Abandon. NewSharedSnapshotInPlace installs a finalizer that normally
+// unmaps the builder memory after capture; a builder with possibly live
+// threads must suppress it.
+func (m *Module) PreserveMemoryOnAbandon() {
+	if g, ok := engineGates.Load(m); ok {
+		g.(*engineGate).preserveMemory.Store(true)
+	}
+}
+
 func (m *Module) release(unmap bool) error {
 	g, ok := engineGates.Load(m)
 	if !ok {
@@ -340,6 +353,9 @@ func (m *Module) release(unmap bool) error {
 	if unmap && !threadsGone(&gate.threads, threadExitWait) {
 		unmap = false
 		err = ErrThreadsAlive
+	}
+	if !unmap && gate.preserveMemory.Load() {
+		runtime.SetFinalizer(m.g, nil)
 	}
 	// Detach the module from its memory before releasing it, so a stray late
 	// call fails a closed-check instead of touching unmapped pages. Memory
