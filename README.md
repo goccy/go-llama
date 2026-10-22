@@ -212,6 +212,14 @@ make test        # fetches a tiny GGUF into testdata/ and runs the suite
 
 Point the suite at your own model with `GO_LLAMA_TEST_MODEL=/path/to.gguf`.
 
+The ModernBERT encoder tests are opt-in: place a GGUF converted with
+llama-wasm's `bench/encoder/convert.py` under `testdata/` and name it with
+`MODERNBERT_GGUF=<file>`. `TestModernBertParity` compares tokenization and the
+CLS embedding with the PyTorch reference in
+`testdata/modernbert-ja-130m-reference.json` (`MODERNBERT_REL_TOL` /
+`MODERNBERT_COS_MIN` loosen the bounds for quantized weights);
+`TestModernBertSpeed` times one embedding for 32 / 128 / 512 tokens.
+
 ## License
 
 MIT (see LICENSE). llama.cpp is MIT; the embedded engine is a derivative work
