@@ -31,7 +31,7 @@ env:
   # The native reference is the SAME llama.cpp commit the engine was
   # built from (goccy/llama-wasm's llama.cpp submodule at the release
   # go.mod pins) — bump it together with the llamawasm2go dependency.
-  LLAMA_CPP_COMMIT: 11924d4c17abc27383376a1ac6a24fa3e36c1c0c
+  LLAMA_CPP_COMMIT: b6334e37e6ef286fc5091a41b6561b2113d915fb
   # The bridge runs ggml single-threaded unless a context asks for more
   # (n_threads defaults to 1), so native is measured with one thread too.
   NATIVE_THREADS: "1"
@@ -68,6 +68,7 @@ jobs:
         run: |
           model=$(lscpu | awk -F: '/Model name/ {gsub(/^ +/, "", $2); print $2; exit}')
           echo "model=${model:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "model_key=$(printf "%s" "${model:-unknown}" | tr -c "A-Za-z0-9" "-")" >> "$GITHUB_OUTPUT"
           echo "cpu: ${model:-unknown} ($(nproc) cores)"
 
       - name: Cache model
@@ -90,7 +91,10 @@ jobs:
           # "static" in the key: the cached binary must not depend on the
           # build tree (a dynamically linked llama-bench restored without
           # its libllama/libggml .so files fails with exit 127).
-          key: llama-bench-static-${{ env.LLAMA_CPP_COMMIT }}-${{ matrix.name }}-${{ runner.os }}
+          # The CPU model in the key: the binary is built with GGML_NATIVE=ON,
+          # so one built on another CPU model of the runner pool can hit an
+          # illegal instruction (exit 132).
+          key: llama-bench-static-${{ env.LLAMA_CPP_COMMIT }}-${{ matrix.name }}-${{ runner.os }}-${{ steps.cpu.outputs.model_key }}
       - name: Build native llama.cpp at the engine's commit
         if: steps.native-cache.outputs.cache-hit != 'true'
         timeout-minutes: 30
